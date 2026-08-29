@@ -23,7 +23,7 @@ def test_cli_compress_decompress_roundtrip(tmp_path):
     tokz_file = tmp_path / "sample.py.tokz"
     restored_file = tmp_path / "sample_restored.py"
 
-    res_comp = _run("compress", str(test_file), "-o", str(tokz_file), "--vocab", "code")
+    res_comp = _run("compress", str(test_file), "-o", str(tokz_file))
     assert res_comp.returncode == 0, res_comp.stderr
     assert tokz_file.exists()
     assert os.path.getsize(tokz_file) < os.path.getsize(test_file)

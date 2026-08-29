@@ -4,18 +4,16 @@ import sys
 import time
 
 from . import core
-from .profiles import default_registry
 
-BANNER = "TokPress -- pure-Python tokenizer-driven compression"
+BANNER = "TokPress -- pure-Python tiktoken-driven compression"
 
 HELP_TEXT = """Usage:
-  tokpress compress <input_path> [-o <output.tokz>] [--vocab general|code|json|pkgmeta|raw|tiktoken]
+  tokpress compress <input_path> [-o <output.tokz>]
   tokpress decompress <input.tokz> [-o <output_path>]
   tokpress bench <input_path>
 
 Options:
   -o, --output <PATH>     Specify output filepath
-  --vocab <TYPE>          Specify domain vocabulary: general (default, no training needed), code, json, pkgmeta, raw (no baked table), or tiktoken (tokenizes with the public tiktoken library; no baked tables or shared dictionary for this mode).
 """
 
 
@@ -31,9 +29,6 @@ def _parse_flags(args: list[str], start: int) -> dict:
         if args[i] in ("-o", "--output") and i + 1 < len(args):
             flags["output"] = args[i + 1]
             i += 2
-        elif args[i] == "--vocab" and i + 1 < len(args):
-            flags["vocab"] = args[i + 1]
-            i += 2
         else:
             i += 1
     return flags
@@ -47,17 +42,12 @@ def cmd_compress(args: list[str]) -> int:
     input_path = args[2]
     flags = _parse_flags(args, 3)
     output_path = flags.get("output", input_path + ".tokz")
-    vocab_name = flags.get("vocab")
-    vocab_type = (
-        default_registry.vocab_type_for_name(vocab_name) if vocab_name is not None else default_registry.default_vocab_type()
-    )
-    vocab = vocab_name if vocab_name is not None else "general"
 
     with open(input_path, "rb") as f:
         data = f.read()
 
     t0 = time.perf_counter()
-    compressed = core.compress(data, vocab)
+    compressed = core.compress(data)
     elapsed = time.perf_counter() - t0
 
     with open(output_path, "wb") as f:
@@ -74,7 +64,6 @@ def cmd_compress(args: list[str]) -> int:
     print(f"  compressed: {compressed_size} bytes")
     print(f"  ratio:      {ratio:.4f}")
     print(f"  time:       {ms:.2f} ms ({mb_s:.2f} MB/s)")
-    _ = vocab_type
     return 0
 
 

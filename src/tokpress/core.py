@@ -14,20 +14,20 @@ def _get_codec() -> TokPressCodec:
     return _codec
 
 
-def compress(data: bytes | str, vocab: str = "general") -> bytes:
+def compress(data: bytes | str) -> bytes:
     if isinstance(data, str):
         data = data.encode("utf-8")
-    return _get_codec().compress(data, vocab)
+    return _get_codec().compress(data)
 
 
 def decompress(compressed_data: bytes) -> bytes:
     return _get_codec().decompress(compressed_data)
 
 
-def compress_file(input_path: str, output_path: str, vocab: str = "general") -> None:
+def compress_file(input_path: str, output_path: str) -> None:
     with open(input_path, "rb") as f:
         data = f.read()
-    compressed = compress(data, vocab)
+    compressed = compress(data)
     with open(output_path, "wb") as f:
         f.write(compressed)
 
@@ -47,9 +47,9 @@ def benchmark(input_path: str) -> dict:
     codec = _get_codec()
 
     t0 = time.perf_counter()
-    compressed = codec.encoders[1].compress(data)  # vocab_type=1 (code)
+    compressed = codec.compress(data)
     t1 = time.perf_counter()
-    restored = codec.decoder.decompress(compressed)
+    restored = codec.decompress(compressed)
     t2 = time.perf_counter()
 
     comp_time = t1 - t0

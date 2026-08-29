@@ -1,4 +1,4 @@
-"""Tests for the "tiktoken" vocab mode (vocab_type=5) -- tokenizes with the public tiktoken library instead of a pretrained domain profile (see profiles.py / codec/encoder.py docstrings)."""
+"""Tests for the tiktoken-backed tokenizer (see tokenizer/tiktoken_adapter.py) and the codec built on top of it."""
 
 import os
 
@@ -7,7 +7,6 @@ import pytest
 import tokpress
 from tokpress.codec.decoder import TokPressDecoder
 from tokpress.codec.encoder import TokPressEncoder
-from tokpress.profiles import TIKTOKEN_VOCAB_TYPE
 from tokpress.tokenizer.tiktoken_adapter import TiktokenTokenizer
 
 
@@ -39,29 +38,23 @@ def test_tiktoken_match_flag_above_every_real_token_id():
     ],
     ids=lambda d: f"{len(d)}B",
 )
-def test_tiktoken_codec_roundtrip(data):
-    enc = TokPressEncoder(TIKTOKEN_VOCAB_TYPE)
+def test_codec_roundtrip(data):
+    enc = TokPressEncoder()
     dec = TokPressDecoder()
     compressed = enc.compress(data)
     assert dec.decompress(compressed) == data
 
 
-def test_tiktoken_random_high_entropy_roundtrip():
+def test_random_high_entropy_roundtrip():
     data = os.urandom(64 * 1024)
-    enc = TokPressEncoder(TIKTOKEN_VOCAB_TYPE)
+    enc = TokPressEncoder()
     dec = TokPressDecoder()
     compressed = enc.compress(data)
     assert dec.decompress(compressed) == data
 
 
-def test_tiktoken_compresses_repetitive_text():
+def test_compresses_repetitive_text():
     payload = b'{"status": 200, "message": "ok", "data": [1, 2, 3]}' * 20
-    compressed = tokpress.compress(payload, vocab="tiktoken")
+    compressed = tokpress.compress(payload)
     assert len(compressed) < len(payload)
-    assert tokpress.decompress(compressed) == payload
-
-
-def test_tiktoken_reachable_via_public_api():
-    payload = b"the quick brown fox jumps over the lazy dog " * 30
-    compressed = tokpress.compress(payload, vocab="tiktoken")
     assert tokpress.decompress(compressed) == payload

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tokpress"
 version = "0.1.0"
-description = "A pure-Python, tokenizer-driven, rANS-entropy-coded lossless compressor for many small, schema-homogeneous records."
+description = "A pure-Python, tiktoken-tokenizer-driven, rANS-entropy-coded lossless compressor."
 requires-python = ">=3.10"
 dependencies = ["tiktoken>=0.5"]
 
@@ -14,10 +14,6 @@ tokpress = "tokpress.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tokpress"]
-# NOTE: pretrained profile data lives in data/ at the project root (not
-# under src/tokpress/), by request -- it is NOT bundled into a built wheel.
-# tokpress only works from a repo checkout (incl. `pip install -e .`)
-# unless TOKPRESS_DATA_DIR is set to point at a deployed copy of data/.
 
 [project.optional-dependencies]
 dev = [

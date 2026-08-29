@@ -1,5 +1,3 @@
-import pytest
-
 from tokpress.codec.decoder import TokPressDecoder
 from tokpress.codec.encoder import TokPressEncoder
 
@@ -17,30 +15,30 @@ JSON_PAYLOAD = (
 ) * 5
 
 
-@pytest.mark.parametrize("vocab_type,payload", [(1, CODE_PAYLOAD), (2, JSON_PAYLOAD)])
-def test_end_to_end_roundtrip(vocab_type, payload):
-    enc = TokPressEncoder(vocab_type)
+def test_end_to_end_roundtrip_code():
+    enc = TokPressEncoder()
     dec = TokPressDecoder()
 
-    compressed = enc.compress(payload)
-    assert len(compressed) < len(payload)
+    compressed = enc.compress(CODE_PAYLOAD)
+    assert len(compressed) < len(CODE_PAYLOAD)
 
     restored = dec.decompress(compressed)
-    assert restored == payload
+    assert restored == CODE_PAYLOAD
 
 
-@pytest.mark.parametrize("vocab_type", [0, 1, 2, 3, 4, 5])
-def test_roundtrip_all_vocab_types(vocab_type):
-    enc = TokPressEncoder(vocab_type)
+def test_end_to_end_roundtrip_json():
+    enc = TokPressEncoder()
     dec = TokPressDecoder()
-    payload = b"some reasonably repetitive test payload " * 20
 
-    compressed = enc.compress(payload)
-    assert dec.decompress(compressed) == payload
+    compressed = enc.compress(JSON_PAYLOAD)
+    assert len(compressed) < len(JSON_PAYLOAD)
+
+    restored = dec.decompress(compressed)
+    assert restored == JSON_PAYLOAD
 
 
 def test_empty_input_roundtrip():
-    enc = TokPressEncoder(1)
+    enc = TokPressEncoder()
     dec = TokPressDecoder()
     compressed = enc.compress(b"")
     assert dec.decompress(compressed) == b""
