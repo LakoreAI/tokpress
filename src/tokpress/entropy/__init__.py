@@ -1,9 +1,9 @@
-from .frequency import SymbolStats, find_context_index
-from .rans import RansDecoder, RansEncoder, RANS_L, RANS_M, RANS_M_BITS
+from .frequency import ContextTableSet, SymbolStats
+from .rans import RANS_L, RANS_M, RANS_M_BITS, RansDecoder, RansEncoder
 
 __all__ = [
     "SymbolStats",
-    "find_context_index",
+    "ContextTableSet",
     "RansEncoder",
     "RansDecoder",
     "RANS_L",

@@ -6,21 +6,27 @@ vocab_type 5 ("tiktoken") tokenizes with the public tiktoken library instead of 
 NUM_PROFILES = 4
 TIKTOKEN_VOCAB_TYPE = 5
 
-_NAME_TO_VOCAB_TYPE = {
-    "raw": 0,
-    "code": 1,
-    "json": 2,
-    "pkgmeta": 3,
-    "general": 4,
-    "tiktoken": TIKTOKEN_VOCAB_TYPE,
-}
+_DEFAULT_VOCAB_TYPE = 4
 
 
 class ProfileRegistry:
-    @staticmethod
-    def vocab_type_for_name(name: str) -> int:
-        return _NAME_TO_VOCAB_TYPE.get(name, 4)
+    """Maps a --vocab name to its wire-format vocab_type byte."""
 
-    @staticmethod
-    def default_vocab_type() -> int:
-        return 4
+    def __init__(self) -> None:
+        self._name_to_vocab_type = {
+            "raw": 0,
+            "code": 1,
+            "json": 2,
+            "pkgmeta": 3,
+            "general": 4,
+            "tiktoken": TIKTOKEN_VOCAB_TYPE,
+        }
+
+    def vocab_type_for_name(self, name: str) -> int:
+        return self._name_to_vocab_type.get(name, _DEFAULT_VOCAB_TYPE)
+
+    def default_vocab_type(self) -> int:
+        return _DEFAULT_VOCAB_TYPE
+
+
+default_registry = ProfileRegistry()

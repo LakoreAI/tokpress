@@ -1,14 +1,13 @@
-"""Decoder: exact mirror of encoder.py's wire format for vocab_type 0-4, plus the "tiktoken" mode (vocab_type 5, see profiles.py / codec/encoder.py). Eagerly builds and caches, for every profile (and the tiktoken tokenizer), its tokenizer, dictionary, order-0 stats, and order-1 context tables at construction -- rebuilding these per-call would be a severe throughput regression."""
+"""Decoder: exact mirror of encoder.py's wire format for vocab_type 0-4, plus the "tiktoken" mode (vocab_type 5, see profiles.py / codec/encoder.py). Eagerly builds and caches, for every profile (and the tiktoken tokenizer), its tokenizer and trained-profile data at construction -- rebuilding these per-call would be a severe throughput regression."""
+
+from .. import _data
 from ..bitstream import BitReader
-from ..entropy.frequency import SymbolStats, find_context_index
-from ..entropy.pretrained_tables import PretrainedTables
+from ..entropy.frequency import SymbolStats
 from ..entropy.rans import RansDecoder
+from ..profile_data import TrainedProfile
+from ..profiles import TIKTOKEN_VOCAB_TYPE
 from ..tokenizer.bpe import ByteTokenizer
 from ..tokenizer.tiktoken_adapter import TiktokenTokenizer
-from ..tokenizer.vocab import DomainVocab
-from ..profiles import TIKTOKEN_VOCAB_TYPE
-from .. import _data
-from .dictionaries import TokenDictionaries
 from .encoder import (
     MODE_RANS_BAKED,
     MODE_RANS_SPARSE,
@@ -25,22 +24,18 @@ class TokPressDecoder:
     def __init__(self) -> None:
         self.tokenizer_raw = ByteTokenizer()
 
+        self.profiles: list[TrainedProfile] = []
         self.tokenizers: list[ByteTokenizer] = []
-        self.dictionaries: list[list[int]] = []
-        self.stats_list: list[SymbolStats] = []
-        self.context_ids_list: list[list[int]] = []
-        self.context_tables_list: list[list[SymbolStats]] = []
-
         for profile_id in range(_data.NUM_PROFILES):
+            profile = TrainedProfile(profile_id)
+            self.profiles.append(profile)
             tok = ByteTokenizer()
-            tok.load_vocab(DomainVocab.for_profile(profile_id))
+            tok.load_vocab(profile.vocab)
             self.tokenizers.append(tok)
-            self.dictionaries.append(TokenDictionaries.dict_for(profile_id))
-            self.stats_list.append(PretrainedTables.stats_for(profile_id))
-            self.context_ids_list.append(PretrainedTables.context_ids_for(profile_id))
-            self.context_tables_list.append(PretrainedTables.context_tables_for(profile_id))
 
         self.tiktoken_tokenizer = TiktokenTokenizer()
+        self._lz = TokenLZMatch()
+        self._lz_tiktoken = TokenLZMatch(match_flag=self.tiktoken_tokenizer.match_flag)
 
     def decompress(self, compressed_bytes: bytes) -> bytes:
         r = BitReader(compressed_bytes)
@@ -58,7 +53,6 @@ class TokPressDecoder:
             return b""
 
         num_lz_tokens = r.read_uint32()
-        match_flag = self.tiktoken_tokenizer.match_flag if vocab_type == TIKTOKEN_VOCAB_TYPE else None
 
         if mode == MODE_RAW_TOKENS:
             lz_tokens = []
@@ -74,21 +68,16 @@ class TokPressDecoder:
             lz_tokens = [r.read_bits(bits_per_symbol) for _ in range(num_lz_tokens)]
 
         elif mode == MODE_RANS_BAKED:
-            profile_id = vocab_type - 1
+            profile = self.profiles[vocab_type - 1]
             rans_state = r.read_uint32()
             num_words = r.read_uint32()
             words = [r.read_uint16() for _ in range(num_words)]
             dec = RansDecoder(rans_state, words)
 
-            stats = self.stats_list[profile_id]
-            context_ids = self.context_ids_list[profile_id]
-            context_tables = self.context_tables_list[profile_id]
-
             lz_tokens = []
             prev = -1
             for _ in range(num_lz_tokens):
-                ctx_idx = find_context_index(context_ids, prev)
-                table = context_tables[ctx_idx] if ctx_idx != -1 else stats
+                table = profile.context_table_set.lookup(prev)
                 sym = dec.decode_symbol(table)
                 lz_tokens.append(sym)
                 prev = sym
@@ -131,11 +120,11 @@ class TokPressDecoder:
             raise ValueError(f"unknown TokPress mode byte: {mode}")
 
         if vocab_type == TIKTOKEN_VOCAB_TYPE:
-            tokens = TokenLZMatch.decode(lz_tokens, [], match_flag=match_flag)
+            tokens = self._lz_tiktoken.decode(lz_tokens, [])
             return self.tiktoken_tokenizer.decode(tokens)
 
-        dictionary = self.dictionaries[vocab_type - 1] if vocab_type > 0 else []
-        tokens = TokenLZMatch.decode(lz_tokens, dictionary)
+        dictionary = self.profiles[vocab_type - 1].dictionary if vocab_type > 0 else []
+        tokens = self._lz.decode(lz_tokens, dictionary)
 
         tokenizer = self.tokenizers[vocab_type - 1] if vocab_type > 0 else self.tokenizer_raw
         return tokenizer.decode(tokens)

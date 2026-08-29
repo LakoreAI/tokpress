@@ -1,6 +1,5 @@
-from .encoder import TokPressEncoder
 from .decoder import TokPressDecoder
-from .dictionaries import TokenDictionaries
+from .encoder import TokPressEncoder
 from .token_lz import TokenLZMatch
 
-__all__ = ["TokPressEncoder", "TokPressDecoder", "TokenDictionaries", "TokenLZMatch"]
+__all__ = ["TokPressEncoder", "TokPressDecoder", "TokenLZMatch"]

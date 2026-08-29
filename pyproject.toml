@@ -19,5 +19,20 @@ packages = ["src/tokpress"]
 # tokpress only works from a repo checkout (incl. `pip install -e .`)
 # unless TOKPRESS_DATA_DIR is set to point at a deployed copy of data/.
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4.0",
+    "pre-commit>=3.0.0",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]

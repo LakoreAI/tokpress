@@ -2,6 +2,7 @@
 
 Blob format (length-prefixed pieces): while offset < len(blob): piece_len = blob[offset]; offset += 1; piece = blob[offset:offset+piece_len]; offset += piece_len -> TokenPiece(piece, next_id), next_id += 1 (starting at 256).
 """
+
 from dataclasses import dataclass
 
 from .. import _data
@@ -35,6 +36,6 @@ class DomainVocab:
     @staticmethod
     def for_profile(profile_id: int) -> "DomainVocab":
         if 0 <= profile_id < _data.NUM_PROFILES:
-            blob = _data.read_binary(profile_id, "vocab.bin")
+            blob = _data.default_store.read_binary(profile_id, "vocab.bin")
             return DomainVocab._from_blob(blob)
         return DomainVocab()

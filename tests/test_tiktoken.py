@@ -1,4 +1,5 @@
 """Tests for the "tiktoken" vocab mode (vocab_type=5) -- tokenizes with the public tiktoken library instead of a pretrained domain profile (see profiles.py / codec/encoder.py docstrings)."""
+
 import os
 
 import pytest
@@ -34,7 +35,7 @@ def test_tiktoken_match_flag_above_every_real_token_id():
         bytes(range(256)),
         b'{"name": "foo", "version": "1.2.3"}' * 5,
         b"def foo(x, y):\n    return x + y\n" * 10,
-        "héllo wörld 日本語 🔥🚀".encode("utf-8") * 20,
+        "héllo wörld 日本語 🔥🚀".encode() * 20,
     ],
     ids=lambda d: f"{len(d)}B",
 )

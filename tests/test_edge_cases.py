@@ -8,7 +8,7 @@ def test_edge_empty_bytes():
 
 
 def test_edge_single_byte():
-    for b in [b"A", b"\x00", b"\xFF", b"\n", b"\x7F"]:
+    for b in [b"A", b"\x00", b"\xff", b"\n", b"\x7f"]:
         compressed = tokpress.compress(b)
         assert tokpress.decompress(compressed) == b
 
@@ -28,7 +28,7 @@ def test_edge_pure_zeros():
 
 
 def test_edge_multibyte_cjk_emojis():
-    text = "🔥 Python 3.12 ⚡ TokPress 🚀 日本語 (Tokyo) 한국어 (Seoul) العربية (Dubai) 🦀 Rust".encode("utf-8") * 200
+    text = "🔥 Python 3.12 ⚡ TokPress 🚀 日本語 (Tokyo) 한국어 (Seoul) العربية (Dubai) 🦀 Rust".encode() * 200
     compressed = tokpress.compress(text, vocab="code")
     assert tokpress.decompress(compressed) == text
 

@@ -1,6 +1,6 @@
 """Public package API: compress, decompress, compress_file, decompress_file, and benchmark."""
+
 import time
-from typing import Union
 
 from .native import TokPressCodec
 
@@ -14,7 +14,7 @@ def _get_codec() -> TokPressCodec:
     return _codec
 
 
-def compress(data: Union[bytes, str], vocab: str = "general") -> bytes:
+def compress(data: bytes | str, vocab: str = "general") -> bytes:
     if isinstance(data, str):
         data = data.encode("utf-8")
     return _get_codec().compress(data, vocab)

@@ -2,19 +2,18 @@
 
 Container: magic "TOKZ" (4B) + version(1B)=1 + vocab_type(1B) + mode(1B) + uncompressed_size(u32 LE), then mode-specific payload.
 
-Modes (vocab_type 0-4): MODE_RAW_TOKENS=0 (bit-packed), MODE_RANS_SPARSE=1 (per-record freq table + rANS), MODE_RAW_FALLBACK=2 (empty input only), MODE_RANS_BAKED=3 (rANS against embedded pretrained tables, no per-record header). All three of A/B/C are always built; the smallest wins.
+Modes (vocab_type 0-4): MODE_RAW_TOKENS=0 (bit-packed), MODE_RANS_SPARSE=1 (per-record freq table + rANS), MODE_RAW_FALLBACK=2 (empty input only), MODE_RANS_BAKED=3 (rANS against embedded pretrained tables, no per-record header). Each candidate mode below is always built; the smallest wins.
 
 Modes (vocab_type=5/tiktoken): MODE_RAW_TOKENS_WIDE=4 and MODE_RANS_SPARSE_WIDE=5 -- tiktoken's ~200k-token vocabulary overflows the 16-bit token-id/alphabet-size fields the other modes use (that format was designed for the ~1280-token custom domain vocabs), so these use wider fields instead. There is no baked-table option for tiktoken mode: no offline training was done for its token space.
 """
+
 from ..bitstream import BitWriter
-from ..entropy.frequency import SymbolStats, find_context_index
-from ..entropy.pretrained_tables import PretrainedTables
+from ..entropy.frequency import SymbolStats
 from ..entropy.rans import RansEncoder
+from ..profile_data import TrainedProfile
+from ..profiles import TIKTOKEN_VOCAB_TYPE
 from ..tokenizer.bpe import ByteTokenizer
 from ..tokenizer.tiktoken_adapter import TiktokenTokenizer
-from ..tokenizer.vocab import DomainVocab
-from ..profiles import TIKTOKEN_VOCAB_TYPE
-from .dictionaries import TokenDictionaries
 from .token_lz import TokenLZMatch
 
 TOKZ_MAGIC = b"TOKZ"
@@ -31,21 +30,16 @@ class TokPressEncoder:
     def __init__(self, vocab_type: int = 1) -> None:
         self.vocab_type = vocab_type
         self.tokenizer = ByteTokenizer()
-        self.dictionary: list[int] = []
-        self.context_ids: list[int] = []
-        self.context_tables: list[SymbolStats] = []
-        self.stats_baked = SymbolStats(0)
+        self.profile: TrainedProfile | None = None
         self.tiktoken_tokenizer: TiktokenTokenizer | None = None
+        self._lz = TokenLZMatch()
 
         if vocab_type == TIKTOKEN_VOCAB_TYPE:
             self.tiktoken_tokenizer = TiktokenTokenizer()
+            self._lz = TokenLZMatch(match_flag=self.tiktoken_tokenizer.match_flag)
         elif vocab_type > 0:
-            profile_id = vocab_type - 1
-            self.tokenizer.load_vocab(DomainVocab.for_profile(profile_id))
-            self.dictionary = TokenDictionaries.dict_for(profile_id)
-            self.context_ids = PretrainedTables.context_ids_for(profile_id)
-            self.context_tables = PretrainedTables.context_tables_for(profile_id)
-            self.stats_baked = PretrainedTables.stats_for(profile_id)
+            self.profile = TrainedProfile(vocab_type - 1)
+            self.tokenizer.load_vocab(self.profile.vocab)
 
     def _write_header(self, w: BitWriter, mode: int, n_raw: int) -> None:
         for b in TOKZ_MAGIC:
@@ -67,27 +61,34 @@ class TokPressEncoder:
         if self.vocab_type == TIKTOKEN_VOCAB_TYPE:
             return self._compress_tiktoken(raw_bytes, n_raw)
 
+        dictionary = self.profile.dictionary if self.profile is not None else []
         tokens = self.tokenizer.encode(raw_bytes)
-        lz_tokens = TokenLZMatch.encode(tokens, self.dictionary)
-        n_lz = len(lz_tokens)
+        lz_tokens = self._lz.encode(tokens, dictionary)
 
-        # --- Option A: MODE_RAW_TOKENS (bit-packed) ---
-        wa = BitWriter()
-        self._write_header(wa, MODE_RAW_TOKENS, n_raw)
-        wa.write_uint32(n_lz)
+        candidates = [
+            self._encode_raw_tokens(lz_tokens, n_raw),
+            self._encode_rans_sparse(lz_tokens, n_raw),
+        ]
+        baked = self._encode_rans_baked(lz_tokens, n_raw)
+        if baked is not None:
+            candidates.append(baked)
+        return min(candidates, key=len)
+
+    def _encode_raw_tokens(self, lz_tokens: list[int], n_raw: int) -> bytes:
+        w = BitWriter()
+        self._write_header(w, MODE_RAW_TOKENS, n_raw)
+        w.write_uint32(len(lz_tokens))
         for tok in lz_tokens:
             if tok < 256:
-                wa.write_bits(0, 1)
-                wa.write_bits(tok, 8)
+                w.write_bits(0, 1)
+                w.write_bits(tok, 8)
             else:
-                wa.write_bits(1, 1)
-                wa.write_bits(tok, 12)
-        wa.flush()
-        packed_buf = wa.getvalue()
-        best_size = len(packed_buf)
-        best_mode = MODE_RAW_TOKENS
+                w.write_bits(1, 1)
+                w.write_bits(tok, 12)
+        w.flush()
+        return w.getvalue()
 
-        # --- Option B: MODE_RANS_SPARSE ---
+    def _encode_rans_sparse(self, lz_tokens: list[int], n_raw: int) -> bytes:
         max_sym = self.tokenizer.vocab_size
         if lz_tokens:
             max_sym = max(max_sym, max(lz_tokens))
@@ -96,110 +97,93 @@ class TokPressEncoder:
         stats_sparse.count_symbols(lz_tokens, build_decode_lut=False)
         active_indices = [i for i in range(alphabet_size) if stats_sparse.freq[i] > 0]
 
-        words_sparse: list[int] = []
-        enc_sparse = RansEncoder()
-        enc_sparse.encode_block(lz_tokens, stats_sparse, words_sparse)
+        words: list[int] = []
+        enc = RansEncoder()
+        enc.encode_block(lz_tokens, stats_sparse, words)
 
-        wb = BitWriter()
-        self._write_header(wb, MODE_RANS_SPARSE, n_raw)
-        wb.write_uint32(n_lz)
-        wb.write_uint16(alphabet_size)
-        wb.write_uint16(len(active_indices))
+        w = BitWriter()
+        self._write_header(w, MODE_RANS_SPARSE, n_raw)
+        w.write_uint32(len(lz_tokens))
+        w.write_uint16(alphabet_size)
+        w.write_uint16(len(active_indices))
         for sym_id in active_indices:
-            wb.write_uint16(sym_id)
-            wb.write_uint16(stats_sparse.freq[sym_id])
-        wb.write_uint32(enc_sparse.state)
-        wb.write_uint32(len(words_sparse))
-        for word in words_sparse:
-            wb.write_uint16(word)
-        wb.flush()
-        rans_buf = wb.getvalue()
-        if len(rans_buf) < best_size:
-            best_size = len(rans_buf)
-            best_mode = MODE_RANS_SPARSE
+            w.write_uint16(sym_id)
+            w.write_uint16(stats_sparse.freq[sym_id])
+        w.write_uint32(enc.state)
+        w.write_uint32(len(words))
+        for word in words:
+            w.write_uint16(word)
+        w.flush()
+        return w.getvalue()
 
-        # --- Option C: MODE_RANS_BAKED (only if vocab_type > 0) ---
-        baked_buf = None
-        if self.vocab_type > 0:
-            baked_covers_all = all(
-                self.stats_baked.freq[sym] > 0 for sym in lz_tokens
-            )
-            if baked_covers_all:
-                words_baked: list[int] = []
-                enc_baked = RansEncoder()
-                for j in range(n_lz - 1, -1, -1):
-                    ctx = lz_tokens[j - 1] if j > 0 else -1
-                    ctx_idx = find_context_index(self.context_ids, ctx)
-                    table = (
-                        self.context_tables[ctx_idx]
-                        if ctx_idx != -1
-                        else self.stats_baked
-                    )
-                    enc_baked.encode_symbol(lz_tokens[j], table, words_baked)
+    def _encode_rans_baked(self, lz_tokens: list[int], n_raw: int) -> bytes | None:
+        if self.profile is None:
+            return None
+        stats_baked = self.profile.stats
+        if not all(stats_baked.freq[sym] > 0 for sym in lz_tokens):
+            return None
 
-                wc = BitWriter()
-                self._write_header(wc, MODE_RANS_BAKED, n_raw)
-                wc.write_uint32(n_lz)
-                wc.write_uint32(enc_baked.state)
-                wc.write_uint32(len(words_baked))
-                for word in words_baked:
-                    wc.write_uint16(word)
-                wc.flush()
-                baked_buf = wc.getvalue()
-                if len(baked_buf) < best_size:
-                    best_mode = MODE_RANS_BAKED
+        n_lz = len(lz_tokens)
+        words: list[int] = []
+        enc = RansEncoder()
+        for j in range(n_lz - 1, -1, -1):
+            ctx = lz_tokens[j - 1] if j > 0 else -1
+            table = self.profile.context_table_set.lookup(ctx)
+            enc.encode_symbol(lz_tokens[j], table, words)
 
-        if best_mode == MODE_RANS_BAKED:
-            return baked_buf
-        elif best_mode == MODE_RANS_SPARSE:
-            return rans_buf
-        else:
-            return packed_buf
+        w = BitWriter()
+        self._write_header(w, MODE_RANS_BAKED, n_raw)
+        w.write_uint32(n_lz)
+        w.write_uint32(enc.state)
+        w.write_uint32(len(words))
+        for word in words:
+            w.write_uint16(word)
+        w.flush()
+        return w.getvalue()
 
     def _compress_tiktoken(self, raw_bytes: bytes, n_raw: int) -> bytes:
         tt = self.tiktoken_tokenizer
         tokens = tt.encode(raw_bytes)
-        lz_tokens = TokenLZMatch.encode(tokens, self.dictionary, match_flag=tt.match_flag)
-        n_lz = len(lz_tokens)
+        lz_tokens = self._lz.encode(tokens, [])
         bits_per_symbol = max(1, tt.match_flag.bit_length())
 
-        # --- Option A': MODE_RAW_TOKENS_WIDE (fixed-width bit-packed) ---
-        wa = BitWriter()
-        self._write_header(wa, MODE_RAW_TOKENS_WIDE, n_raw)
-        wa.write_uint32(n_lz)
-        wa.write_byte(bits_per_symbol)
-        for tok in lz_tokens:
-            wa.write_bits(tok, bits_per_symbol)
-        wa.flush()
-        packed_buf = wa.getvalue()
-        best_size = len(packed_buf)
-        best_mode = MODE_RAW_TOKENS_WIDE
+        candidates = [
+            self._encode_raw_tokens_wide(lz_tokens, n_raw, bits_per_symbol),
+            self._encode_rans_sparse_wide(lz_tokens, n_raw, tt.match_flag),
+        ]
+        return min(candidates, key=len)
 
-        # --- Option B': MODE_RANS_SPARSE_WIDE (u32 alphabet_size/sym_id) ---
-        alphabet_size = tt.match_flag + 1
+    def _encode_raw_tokens_wide(self, lz_tokens: list[int], n_raw: int, bits_per_symbol: int) -> bytes:
+        w = BitWriter()
+        self._write_header(w, MODE_RAW_TOKENS_WIDE, n_raw)
+        w.write_uint32(len(lz_tokens))
+        w.write_byte(bits_per_symbol)
+        for tok in lz_tokens:
+            w.write_bits(tok, bits_per_symbol)
+        w.flush()
+        return w.getvalue()
+
+    def _encode_rans_sparse_wide(self, lz_tokens: list[int], n_raw: int, match_flag: int) -> bytes:
+        alphabet_size = match_flag + 1
         stats_sparse = SymbolStats(alphabet_size)
         stats_sparse.count_symbols(lz_tokens, build_decode_lut=False)
         active_indices = [i for i in range(alphabet_size) if stats_sparse.freq[i] > 0]
 
-        words_sparse: list[int] = []
-        enc_sparse = RansEncoder()
-        enc_sparse.encode_block(lz_tokens, stats_sparse, words_sparse)
+        words: list[int] = []
+        enc = RansEncoder()
+        enc.encode_block(lz_tokens, stats_sparse, words)
 
-        wb = BitWriter()
-        self._write_header(wb, MODE_RANS_SPARSE_WIDE, n_raw)
-        wb.write_uint32(n_lz)
-        wb.write_uint32(alphabet_size)
-        wb.write_uint32(len(active_indices))
+        w = BitWriter()
+        self._write_header(w, MODE_RANS_SPARSE_WIDE, n_raw)
+        w.write_uint32(len(lz_tokens))
+        w.write_uint32(alphabet_size)
+        w.write_uint32(len(active_indices))
         for sym_id in active_indices:
-            wb.write_uint32(sym_id)
-            wb.write_uint16(stats_sparse.freq[sym_id])  # freq <= RANS_M-1, always fits 16 bits
-        wb.write_uint32(enc_sparse.state)
-        wb.write_uint32(len(words_sparse))
-        for word in words_sparse:
-            wb.write_uint16(word)
-        wb.flush()
-        rans_buf = wb.getvalue()
-        if len(rans_buf) < best_size:
-            best_mode = MODE_RANS_SPARSE_WIDE
-
-        return rans_buf if best_mode == MODE_RANS_SPARSE_WIDE else packed_buf
+            w.write_uint32(sym_id)
+            w.write_uint16(stats_sparse.freq[sym_id])  # freq <= RANS_M-1, always fits 16 bits
+        w.write_uint32(enc.state)
+        w.write_uint32(len(words))
+        for word in words:
+            w.write_uint16(word)
+        w.flush()
+        return w.getvalue()

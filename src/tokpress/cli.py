@@ -1,9 +1,10 @@
 """TokPress CLI: compress/decompress/bench subcommands."""
+
 import sys
 import time
 
 from . import core
-from .profiles import ProfileRegistry
+from .profiles import default_registry
 
 BANNER = "TokPress -- pure-Python tokenizer-driven compression"
 
@@ -48,9 +49,7 @@ def cmd_compress(args: list[str]) -> int:
     output_path = flags.get("output", input_path + ".tokz")
     vocab_name = flags.get("vocab")
     vocab_type = (
-        ProfileRegistry.vocab_type_for_name(vocab_name)
-        if vocab_name is not None
-        else ProfileRegistry.default_vocab_type()
+        default_registry.vocab_type_for_name(vocab_name) if vocab_name is not None else default_registry.default_vocab_type()
     )
     vocab = vocab_name if vocab_name is not None else "general"
 

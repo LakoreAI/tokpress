@@ -2,6 +2,7 @@
 
 tiktoken's public API (`Encoding.encode`) takes `str`, not arbitrary `bytes` -- but TokPress compresses arbitrary byte records, which are not always valid UTF-8 (e.g. a lone 0xFF byte). tiktoken's own byte-level BPE core operates on bytes internally, and exposes it via `Encoding._encode_bytes` (private, but the standard way tiktoken itself handles non-UTF-8 input -- e.g. via ftfy/surrogate handling in `encode()`) paired with the public `Encoding.decode_bytes`. Using that pair gives us exact, lossless byte-level roundtrip for arbitrary binary input, not just text.
 """
+
 import tiktoken
 
 DEFAULT_ENCODING_NAME = "o200k_base"

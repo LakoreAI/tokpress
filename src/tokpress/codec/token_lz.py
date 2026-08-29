@@ -1,6 +1,8 @@
-"""Token-level LZ77 with dictionary priming (zstd/FemtoZip-style shared cross-record match history)."""
+"""Token-level LZ77 with dictionary priming (zstd/FemtoZip-style shared
+cross-record match history).
+"""
 
-MATCH_FLAG = 0x0FFF  # 4095, a symbol above normal vocab range
+DEFAULT_MATCH_FLAG = 0x0FFF  # 4095, a symbol above normal vocab range
 MATCH_WINDOW = 32768  # keeps distances < 2**16 (2-byte distance field)
 MIN_MATCH_LEN = 5  # matches of length 3-4 are a net loss given the 4-token match tuple
 
@@ -10,8 +12,13 @@ def _prefix_hash(t0: int, t1: int) -> int:
 
 
 class TokenLZMatch:
-    @staticmethod
-    def encode(tokens: list[int], dictionary: list[int] = (), match_flag: int = MATCH_FLAG) -> list[int]:
+    """A token-level LZ77 matcher for one match_flag/vocab regime."""
+
+    def __init__(self, match_flag: int = DEFAULT_MATCH_FLAG) -> None:
+        self.match_flag = match_flag
+
+    def encode(self, tokens: list[int], dictionary: list[int] = ()) -> list[int]:
+        match_flag = self.match_flag
         d = len(dictionary)
         combined = list(dictionary) + list(tokens)
         n = len(combined)
@@ -58,8 +65,8 @@ class TokenLZMatch:
                 i += 1
         return output
 
-    @staticmethod
-    def decode(lz_tokens: list[int], dictionary: list[int] = (), match_flag: int = MATCH_FLAG) -> list[int]:
+    def decode(self, lz_tokens: list[int], dictionary: list[int] = ()) -> list[int]:
+        match_flag = self.match_flag
         output = list(dictionary)
         d = len(dictionary)
         n = len(lz_tokens)

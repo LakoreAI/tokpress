@@ -4,9 +4,7 @@ import sys
 
 
 def _run(*args):
-    return subprocess.run(
-        [sys.executable, "-m", "tokpress", *args], capture_output=True, text=True
-    )
+    return subprocess.run([sys.executable, "-m", "tokpress", *args], capture_output=True, text=True)
 
 
 def test_cli_help():

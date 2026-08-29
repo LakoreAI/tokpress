@@ -2,6 +2,7 @@
 
 State is masked to 32 bits after every update to mirror fixed-width UInt32 wraparound semantics, even though it's unlikely to be exercised in practice given RANS_L keeps state well under 2**32 under normal operation.
 """
+
 from .frequency import SymbolStats
 
 RANS_M_BITS = 12
