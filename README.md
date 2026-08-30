@@ -26,7 +26,7 @@ whole-stream compressors on a per-record basis.
 flowchart LR
     A["byte record x"] --> B["1. TOKENIZER<br/>byte-exact BPE: o200k_base or trained vocab"]
     B -->|"token ids"| C["2. TOKEN-LEVEL LZ77<br/>greedy hash parser, match len l >= 3, flag = vocab size"]
-    C -->|"literals + match tuples"| D["3. ENTROPY (rANS) + BITSTREAM<br/>raw / sparse / split / adaptive / adaptive-split / PPM / dict-cascade"]
+    C -->|"literals + match tuples"| D["3. ENTROPY (rANS) + BITSTREAM<br/>raw / sparse / split / adaptive / adaptive-split / PPM / PPM-split / dict-cascade"]
     D -->|"candidate streams"| E["min gate: build all candidates, keep the smallest"]
     E --> F[".tokz / .tokbi stream"]
     G["training sample: N schema-homogeneous records"] --> H["offline train<br/>train-vocab → .ranks<br/>train-dict → .tokdict"]
@@ -173,14 +173,13 @@ regime), with a `TokDict` trained on a disjoint training split:
 | backend | ratio (held-out records) |
 |---|---|
 | per-record, no dictionary | 0.806 |
-| per-record + `TokDict` | 0.260 |
+| per-record + `TokDict` | 0.2565 |
 | **batch (`compress_many`) + `TokDict`** | **0.228** |
 | `zstd -19` + matched dict, batch (blob) | 0.137 |
 
 TokPress beats every dictionary-less baseline and most of the gap to zstd's
 matched dictionary, but zstd's mature COVER/FastCover dictionary training
-and FSE tables remain ahead. See `docs/VISION.md` for the full numbers and
-the honest takeaway.
+and FSE tables remain ahead. Reproduce with `python scripts/bench.py`.
 
 ---
 
@@ -191,7 +190,7 @@ pip install -e .
 pytest tests/
 ```
 
-The suite (81 tests) covers bitstream and rANS roundtrips (incl. the
+The suite (93 tests) covers bitstream and rANS roundtrips (incl. the
 single-symbol-alphabet edge case), token-level LZ77 roundtrip, the tiktoken
 adapter's byte-exact roundtrip on arbitrary binary input (including invalid
 UTF-8), full codec roundtrips across payload shapes, `TokDict`
@@ -212,8 +211,7 @@ Without a trained dictionary, every record is compressed independently, so
 small or non-repetitive records can come out **larger** than the input. The
 `compress_many` batch mode and a trained `TokDict` fix this for
 many-small-homogeneous-records workloads, but only when you have
-representative training data to build a dictionary from. See
-`docs/STATUS.md` for the honest tradeoffs.
+representative training data to build a dictionary from.
 
 ---
 
