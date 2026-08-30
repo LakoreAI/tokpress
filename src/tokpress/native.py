@@ -2,12 +2,13 @@
 
 from .codec.decoder import TokPressDecoder
 from .codec.encoder import TokPressEncoder
+from .dictionary import TokDict
 
 
 class TokPressCodec:
-    def __init__(self) -> None:
-        self.encoder = TokPressEncoder()
-        self.decoder = TokPressDecoder()
+    def __init__(self, dictionary: TokDict | None = None) -> None:
+        self.encoder = TokPressEncoder(dictionary=dictionary)
+        self.decoder = TokPressDecoder(dictionary=dictionary)
 
     def compress(self, data: bytes) -> bytes:
         return self.encoder.compress(data)

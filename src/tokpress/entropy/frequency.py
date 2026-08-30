@@ -28,9 +28,27 @@ class SymbolStats:
             if idx < self.alphabet_size:
                 raw_counts[idx] += 1
                 total_symbols += 1
+        self.normalize(raw_counts, total_symbols, build_decode_lut)
 
+    def normalize(self, raw_counts: list[int], total_symbols: int, build_decode_lut: bool = True) -> None:
+        """Scale a raw per-symbol count array (len == alphabet_size) to sum to
+        RANS_M. Shared by count_symbols (per-record, counts derived from a
+        symbol list) and TokDict.train (dictionary-wide, counts accumulated
+        across many training records) -- both must go through this one place
+        so the RANS_M-feasibility invariant below is enforced everywhere.
+        """
         if total_symbols == 0:
             return
+
+        distinct = sum(1 for c in raw_counts if c > 0)
+        if distinct > RANS_M:
+            raise ValueError(
+                f"{distinct} distinct symbols exceeds RANS_M={RANS_M}: "
+                "every active symbol needs freq >= 1, so their frequencies can never be "
+                "rebalanced down to sum to RANS_M. Caller must check this before calling "
+                "normalize/count_symbols (e.g. skip the per-record sparse-rANS candidate "
+                "for this record, or cap a trained dictionary to its top RANS_M symbols)."
+            )
 
         target_sum = RANS_M
         max_allowed_freq = target_sum - 1

@@ -2,6 +2,7 @@
 
 import time
 
+from .dictionary import TokDict
 from .native import TokPressCodec
 
 _codec: TokPressCodec | None = None
@@ -14,14 +15,18 @@ def _get_codec() -> TokPressCodec:
     return _codec
 
 
-def compress(data: bytes | str) -> bytes:
+def compress(data: bytes | str, dictionary: TokDict | None = None) -> bytes:
     if isinstance(data, str):
         data = data.encode("utf-8")
-    return _get_codec().compress(data)
+    if dictionary is None:
+        return _get_codec().compress(data)
+    return TokPressCodec(dictionary=dictionary).compress(data)
 
 
-def decompress(compressed_data: bytes) -> bytes:
-    return _get_codec().decompress(compressed_data)
+def decompress(compressed_data: bytes, dictionary: TokDict | None = None) -> bytes:
+    if dictionary is None:
+        return _get_codec().decompress(compressed_data)
+    return TokPressCodec(dictionary=dictionary).decompress(compressed_data)
 
 
 def compress_file(input_path: str, output_path: str) -> None:
