@@ -1,4 +1,4 @@
-"""TokPress CLI: compress/decompress/bench/train-dict subcommands."""
+"""TokPress CLI: compress/decompress/pack/unpack/bench/train-dict/train-vocab subcommands."""
 
 import os
 import sys
@@ -6,29 +6,47 @@ import time
 
 from . import core
 from .dictionary import TokDict
+from .tokenizer import bpe_trainer
+from .tokenizer.tiktoken_adapter import TiktokenTokenizer
 
 BANNER = "TokPress -- pure-Python tiktoken-driven compression"
 
 HELP_TEXT = """Usage:
-  tokpress compress <input_path> [-o <output.tokz>] [--dict <dict.tokdict>]
-  tokpress decompress <input.tokz> [-o <output_path>] [--dict <dict.tokdict>]
-  tokpress pack <output.tokz> <record_path> [record_path ...] [--dict <dict.tokdict>]
-  tokpress unpack <input.tokz> <out_dir> [--dict <dict.tokdict>]
+  tokpress compress <input_path> [-o <output.tokz>] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
+  tokpress decompress <input.tokz> [-o <output_path>] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
+  tokpress pack <output.tokz> <record_path> [record_path ...] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
+  tokpress unpack <input.tokz> <out_dir> [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
   tokpress bench <input_path>
+  tokpress tokenize-stats <input_path> [--vocab <vocab.ranks>]
   tokpress train-dict <output.tokdict> <sample_path> [sample_path ...]
+  tokpress train-vocab <output.ranks> <corpus_path> [corpus_path ...] [--vocab-size N] [--max-bytes N]
 
 Options:
   -o, --output <PATH>     Specify output filepath
   --dict <PATH>           Use a TokDict trained cross-record dictionary
                           (see `train-dict`) for compress/decompress
+  --vocab <PATH>          Use a custom byte-level BPE vocabulary trained by
+                          `train-vocab` (a tiktoken-format rank file). The
+                          SAME vocab must be supplied to decompress/unpack.
+  --vocab-size N          train-vocab: target vocabulary size (default 4096)
+  --max-bytes N           train-vocab: cap the training corpus (sampled from
+                          the start) to N bytes (default 262144)
 
 pack/unpack: batch-compress many independent records as one stream (each
 <record_path> is one record), so the entropy model adapts across records --
 far smaller than per-record compression on many small homogeneous records.
 
+tokenize-stats: report tokenizer-quality statistics (tokens/KB, order-0 and
+order-1 entropy, adjacent-token mutual information) -- compression is a
+validated intrinsic signal of tokenizer quality (Goldman et al., EMNLP 2024).
+
 train-dict: each sample file is read as records. UTF-8 newline-delimited
 files (files with two or more newlines, e.g. .jsonl logs) are split per
 line into individual records; any other file is treated as one record.
+
+train-vocab: learns a byte-level BPE vocabulary from the corpus files and
+writes a valid merge chain usable by --vocab. Correctness-first trainer,
+meant for a sampled corpus (see --max-bytes).
 """
 
 
@@ -47,9 +65,39 @@ def _parse_flags(args: list[str], start: int) -> dict:
         elif args[i] == "--dict" and i + 1 < len(args):
             flags["dict"] = args[i + 1]
             i += 2
+        elif args[i] == "--vocab" and i + 1 < len(args):
+            flags["vocab"] = args[i + 1]
+            i += 2
         else:
             i += 1
     return flags
+
+
+_FLAG_TOKENS = ("-o", "--output", "--dict", "--vocab", "--vocab-size", "--max-bytes")
+
+
+def _parse_positional(args: list[str], start: int) -> list[str]:
+    """Return the positional (non-flag) tokens from args[start:], skipping
+    flag names and their value tokens."""
+    positional = []
+    i = start
+    while i < len(args):
+        if args[i] in _FLAG_TOKENS and i + 1 < len(args):
+            i += 2
+        else:
+            positional.append(args[i])
+            i += 1
+    return positional
+
+
+def _load_tokenizer(vocab_path: str | None) -> TiktokenTokenizer | None:
+    if vocab_path is None:
+        return None
+    ranks = bpe_trainer.load_rank_file(vocab_path)
+    if not bpe_trainer.validate_mergeable_ranks(ranks):
+        raise ValueError(f"vocab file {vocab_path} is not a valid byte-level BPE merge chain")
+    enc = bpe_trainer.build_tiktoken_encoding(ranks, name=f"tokpress:{vocab_path}")
+    return TiktokenTokenizer(encoding=enc)
 
 
 def cmd_compress(args: list[str]) -> int:
@@ -61,12 +109,13 @@ def cmd_compress(args: list[str]) -> int:
     flags = _parse_flags(args, 3)
     output_path = flags.get("output", input_path + ".tokz")
     dictionary = TokDict.load(flags["dict"]) if "dict" in flags else None
+    tokenizer = _load_tokenizer(flags.get("vocab"))
 
     with open(input_path, "rb") as f:
         data = f.read()
 
     t0 = time.perf_counter()
-    compressed = core.compress(data, dictionary=dictionary)
+    compressed = core.compress(data, dictionary=dictionary, tokenizer=tokenizer)
     elapsed = time.perf_counter() - t0
 
     with open(output_path, "wb") as f:
@@ -99,12 +148,13 @@ def cmd_decompress(args: list[str]) -> int:
         default_output = input_path + ".decompressed"
     output_path = flags.get("output", default_output)
     dictionary = TokDict.load(flags["dict"]) if "dict" in flags else None
+    tokenizer = _load_tokenizer(flags.get("vocab"))
 
     with open(input_path, "rb") as f:
         compressed = f.read()
 
     t0 = time.perf_counter()
-    restored = core.decompress(compressed, dictionary=dictionary)
+    restored = core.decompress(compressed, dictionary=dictionary, tokenizer=tokenizer)
     elapsed = time.perf_counter() - t0
 
     with open(output_path, "wb") as f:
@@ -189,9 +239,10 @@ def cmd_pack(args: list[str]) -> int:
         print_help()
         return 1
     output_path = args[2]
-    record_paths = args[3:]
+    record_paths = _parse_positional(args, 3)
     flags = _parse_flags(args, 3)
     dictionary = TokDict.load(flags["dict"]) if "dict" in flags else None
+    tokenizer = _load_tokenizer(flags.get("vocab"))
 
     records = []
     for path in record_paths:
@@ -199,7 +250,7 @@ def cmd_pack(args: list[str]) -> int:
             records.append(f.read())
 
     t0 = time.perf_counter()
-    compressed = core.compress_many(records, dictionary=dictionary)
+    compressed = core.compress_many(records, dictionary=dictionary, tokenizer=tokenizer)
     elapsed = time.perf_counter() - t0
 
     with open(output_path, "wb") as f:
@@ -224,12 +275,13 @@ def cmd_unpack(args: list[str]) -> int:
     out_dir = args[3]
     flags = _parse_flags(args, 3)
     dictionary = TokDict.load(flags["dict"]) if "dict" in flags else None
+    tokenizer = _load_tokenizer(flags.get("vocab"))
 
     with open(input_path, "rb") as f:
         compressed = f.read()
 
     t0 = time.perf_counter()
-    records = core.decompress_many(compressed, dictionary=dictionary)
+    records = core.decompress_many(compressed, dictionary=dictionary, tokenizer=tokenizer)
     elapsed = time.perf_counter() - t0
 
     os.makedirs(out_dir, exist_ok=True)
@@ -240,6 +292,89 @@ def cmd_unpack(args: list[str]) -> int:
 
     print(f"Unpacked: {out_dir} ({len(records)} records)")
     print(f"  time:     {elapsed * 1000:.2f} ms")
+    return 0
+
+
+def cmd_train_vocab(args: list[str]) -> int:
+    if len(args) < 4:
+        print("Error: usage: tokpress train-vocab <output.ranks> <corpus_path> [corpus_path ...]")
+        print_help()
+        return 1
+    output_path = args[2]
+
+    vocab_size = 4096
+    max_bytes = 256 * 1024
+    corpus_paths = _parse_positional(args, 3)
+    if "--vocab-size" in args or "--max-bytes" in args:
+        # re-scan for train-vocab's own flags (not in _parse_flags' set)
+        i = 3
+        while i < len(args):
+            if args[i] == "--vocab-size" and i + 1 < len(args):
+                vocab_size = int(args[i + 1])
+                i += 2
+            elif args[i] == "--max-bytes" and i + 1 < len(args):
+                max_bytes = int(args[i + 1])
+                i += 2
+            else:
+                i += 1
+    if not corpus_paths:
+        print("Error: no corpus paths given")
+        print_help()
+        return 1
+
+    chunks = []
+    for p in corpus_paths:
+        with open(p, "rb") as f:
+            chunks.append(f.read())
+    corpus = b"".join(chunks)
+    corpus = bpe_trainer.sample_corpus(corpus, max_bytes)
+
+    def _progress(done: int, total: int) -> None:
+        if done % 500 == 0 or done == total:
+            print(f"  merges: {done}/{total}")
+
+    t0 = time.perf_counter()
+    ranks = bpe_trainer.train_mergeable_ranks(corpus, vocab_size, progress=_progress)
+    elapsed = time.perf_counter() - t0
+
+    if not bpe_trainer.validate_mergeable_ranks(ranks):
+        print("Error: trained vocabulary failed merge-chain validation")
+        return 1
+    bpe_trainer.dump_rank_file(ranks, output_path)
+
+    enc = bpe_trainer.build_tiktoken_encoding(ranks)
+    tokens = enc._encode_bytes(corpus)
+    mean_tokens_per_kb = len(tokens) / max(1, len(corpus) / 1024)
+    print(f"Trained vocabulary: {output_path}")
+    print(f"  corpus:            {len(corpus)} bytes (sampled to {max_bytes})")
+    print(f"  tokens:            {len(ranks)}")
+    print(f"  time:              {elapsed:.2f}s")
+    print(f"  mean tokens/KB:    {mean_tokens_per_kb:.1f} on the training sample")
+    return 0
+
+
+def cmd_tokenize_stats(args: list[str]) -> int:
+    if len(args) < 3:
+        print("Error: missing input_path")
+        print_help()
+        return 1
+    input_path = args[2]
+    flags = _parse_flags(args, 3)
+    tokenizer = _load_tokenizer(flags.get("vocab"))
+
+    with open(input_path, "rb") as f:
+        data = f.read()
+
+    s = core.tokenize_stats(data, tokenizer=tokenizer)
+    print(f"tokenize-stats: {input_path}")
+    print(f"  bytes:                       {s['bytes']}")
+    print(f"  tokens:                      {s['tokens']} ({s['unique_tokens']} unique)")
+    print(f"  tokens/KB:                   {s['tokens_per_kb']:.1f}")
+    print(f"  bytes/token:                 {s['bytes_per_token']:.3f}")
+    print(f"  order-0 entropy (bits/token): {s['entropy_bits_per_token']:.3f}")
+    print(f"  order-1 entropy (bits/token): {s['cond_entropy_bits_per_token']:.3f}")
+    print(f"  adjacent MI I(T0;T1) bits/tok: {s['adjacent_mutual_info_bits_per_token']:.3f}")
+    print(f"  order-0 entropy (bits/byte):  {s['entropy_bits_per_byte']:.3f}")
     return 0
 
 
@@ -261,8 +396,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_unpack(args)
     elif cmd in ("bench", "b"):
         return cmd_bench(args)
+    elif cmd == "tokenize-stats":
+        return cmd_tokenize_stats(args)
     elif cmd == "train-dict":
         return cmd_train_dict(args)
+    elif cmd == "train-vocab":
+        return cmd_train_vocab(args)
     elif cmd in ("help", "--help", "-h"):
         print_help()
         return 0

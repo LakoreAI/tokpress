@@ -28,6 +28,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+# Cross-record adaptive batch mode (docs/TODO.md item A): compress_many
+# concatenates records and compresses them as ONE stream, so the chunked-
+# adaptive entropy model and the LZ history span the whole batch. This is
+# the TokPress analogue of LogLite-style streaming log compression and of
+# RFC 9842 dictionary compression over HTTP -- see docs/VISION.md §use-case.
+from tokpress import compress_many, decompress_many  # noqa: E402
 from tokpress.codec.decoder import TokPressDecoder  # noqa: E402
 from tokpress.codec.encoder import TokPressEncoder  # noqa: E402
 from tokpress.dictionary import TokDict  # noqa: E402
@@ -107,8 +113,15 @@ try:
     import brotli as _brotli
 
     BROTLI_AVAILABLE = True
+    # The `brotli` PyPI bindings (as of 1.2.0) do NOT expose custom-dictionary
+    # compression on `compress`/`Compressor`, and there is no brotli CLI
+    # guaranteed on PATH -- so the brotli+dict baseline is reported SKIPPED
+    # rather than fabricated. (RFC 9842's `dcb` uses brotli dictionaries; a
+    # real measurement would need a brotli build with dict support.)
+    BROTLI_DICT_AVAILABLE = False
 except ImportError:
     BROTLI_AVAILABLE = False
+    BROTLI_DICT_AVAILABLE = False
 
 try:
     import lz4.frame as _lz4
@@ -242,6 +255,19 @@ def run_many_small_records() -> None:
         stdev_ms = statistics.stdev(times) * 1000 if len(times) > 1 else 0.0
         print(_row(backend_name, total_compressed, total_compressed / total_raw, mean_ms, stdev_ms, ok))
 
+    print("\n-- mode: one adaptive stream over all records (cross-record adaptation) --")
+    print_header()
+    try:
+        result, times = _time_n(lambda: compress_many(lines))
+    except Exception as e:  # noqa: BLE001
+        print(f"{'tokpress+batch':<38} ERROR: {e}")
+    else:
+        total_compressed = len(result)
+        ok = decompress_many(result) == lines
+        mean_ms = statistics.mean(times) * 1000
+        stdev_ms = statistics.stdev(times) * 1000 if len(times) > 1 else 0.0
+        print(_row("tokpress+batch", total_compressed, total_compressed / total_raw, mean_ms, stdev_ms, ok))
+
     run_trained_dictionary_regime(lines)
 
 
@@ -307,6 +333,7 @@ def run_trained_dictionary_regime(lines: list[bytes], split_frac: float = 0.7, l
         print(_row(backend_name, total_compressed, total_compressed / total_raw, mean_ms, stdev_ms, ok))
 
     # zstd with a dictionary trained on train_records, applied to test_records.
+    zdict = None
     if ZSTD_AVAILABLE:
         zdict = _zstd_train_dict(train_records)
         if zdict is None:
@@ -354,6 +381,48 @@ def run_trained_dictionary_regime(lines: list[bytes], split_frac: float = 0.7, l
         _row("tokpress+dict", total_compressed, total_compressed / total_raw, mean_ms, stdev_ms, ok)
         + f"  (priming {len(tokdict.priming_tokens)} tok, {len(tokdict.context_stats)} ctx tables, table {n_active} sym)"
     )
+
+    # Batch variants on the same held-out test records: one adaptive stream
+    # over ALL of them at once, primed with the same trained dictionary --
+    # the TokPress analogue of dictionary compression over HTTP (RFC 9842)
+    # and of LogLite-style streaming log compression.
+    try:
+        result, times = _time_n(lambda: compress_many(test_records, dictionary=tokdict))
+    except Exception as e:  # noqa: BLE001
+        print(f"{'tokpress+dict+batch':<38} ERROR: {e}")
+    else:
+        ok = decompress_many(result, dictionary=tokdict) == test_records
+        mean_ms = statistics.mean(times) * 1000
+        stdev_ms = statistics.stdev(times) * 1000 if len(times) > 1 else 0.0
+        print(_row("tokpress+dict+batch", len(result), len(result) / total_raw, mean_ms, stdev_ms, ok))
+
+    if ZSTD_AVAILABLE and zdict is not None:
+        with tempfile.NamedTemporaryFile(suffix=".dict") as dict_file:
+            dict_file.write(zdict)
+            dict_file.flush()
+            blob = b"\n".join(test_records)
+
+            def _zstd_dict_blob() -> bytes:
+                return subprocess.run(
+                    ["zstd", "-19", "-D", dict_file.name, "-c"], input=blob, capture_output=True, check=True
+                ).stdout
+
+            try:
+                result, times = _time_n(_zstd_dict_blob)
+            except Exception as e:  # noqa: BLE001
+                print(f"{'zstd_19+dict+batch(blob)':<38} ERROR: {e}")
+            else:
+                ok = (
+                    subprocess.run(
+                        ["zstd", "-d", "-D", dict_file.name, "-c"], input=result, capture_output=True, check=True
+                    ).stdout
+                    == blob
+                )
+                mean_ms = statistics.mean(times) * 1000
+                stdev_ms = statistics.stdev(times) * 1000 if len(times) > 1 else 0.0
+                print(_row("zstd_19+dict+batch(blob)", len(result), len(result) / len(blob), mean_ms, stdev_ms, ok))
+    if BROTLI_AVAILABLE and not BROTLI_DICT_AVAILABLE:
+        print(f"{'brotli_11+dict':<38} SKIPPED (brotli PyPI bindings lack custom-dictionary support)")
 
 
 def run_paper_scale_dictionary_regime() -> None:
@@ -425,7 +494,10 @@ def run_cross_schema_generalization() -> None:
 
     d_json = TokDict.train(json_train)
     d_code = TokDict.train(code_train)
-    for label, d in (("tokpress+dict (json-trained, WRONG schema)", d_json), ("tokpress+dict (code-trained, matched)", d_code)):
+    for label, d in (
+        ("tokpress+dict (json-trained, WRONG schema)", d_json),
+        ("tokpress+dict (code-trained, matched)", d_code),
+    ):
         total, ok = _eval_tokdict(d)
         print(f"{label:<48} {total:>12} {total / total_raw:>8.4f}{'  OK' if ok else '  MISMATCH'}")
 
@@ -435,7 +507,10 @@ def run_cross_schema_generalization() -> None:
 
         zd_json = _zstd_train_dict(json_train)
         zd_code = _zstd_train_dict(code_train)
-        for label, zd in (("zstd_19+dict (json-trained, WRONG schema)", zd_json), ("zstd_19+dict (code-trained, matched)", zd_code)):
+        for label, zd in (
+            ("zstd_19+dict (json-trained, WRONG schema)", zd_json),
+            ("zstd_19+dict (code-trained, matched)", zd_code),
+        ):
             if zd is None:
                 print(f"{label:<48} ERROR: zstd --train failed")
                 continue
@@ -443,7 +518,11 @@ def run_cross_schema_generalization() -> None:
                 f.write(zd)
                 f.flush()
                 total = sum(
-                    len(subprocess.run(["zstd", "-19", "-D", f.name, "-c"], input=r, capture_output=True, check=True).stdout)
+                    len(
+                        subprocess.run(
+                            ["zstd", "-19", "-D", f.name, "-c"], input=r, capture_output=True, check=True
+                        ).stdout
+                    )
                     for r in code_test
                 )
             print(f"{label:<48} {total:>12} {total / total_raw:>8.4f}")

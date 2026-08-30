@@ -108,3 +108,45 @@ def test_cli_pack_unpack_roundtrip(tmp_path):
     assert len(restored) == 30
     for i, rec in enumerate(records):
         assert (out_dir / f"{i:04d}.rec").read_bytes() == rec
+
+
+def test_cli_train_vocab_and_use(tmp_path):
+    """train-vocab learns a custom byte-level BPE vocab; compress/decompress
+    with --vocab round-trips byte-exact."""
+    corpus = tmp_path / "corpus.jsonl"
+    lines = []
+    for i in range(200):
+        lines.append(f'{{"user": "u{i}", "action": "click", "ts": {1700000000 + i}}}')
+    corpus.write_text("\n".join(lines) + "\n")
+
+    vocab = tmp_path / "vocab.ranks"
+    res = _run("train-vocab", str(vocab), str(corpus), "--vocab-size", "1024")
+    assert res.returncode == 0, res.stderr
+    assert "Trained vocabulary" in res.stdout
+    assert "tokens:" in res.stdout
+
+    payload = tmp_path / "record.json"
+    payload.write_text('{"user": "u555", "action": "click", "ts": 1700000555}')
+    tokz = tmp_path / "record.tokz"
+    out = tmp_path / "record.out"
+
+    assert _run("compress", str(payload), "-o", str(tokz), "--vocab", str(vocab)).returncode == 0
+    assert _run("decompress", str(tokz), "-o", str(out), "--vocab", str(vocab)).returncode == 0
+    assert out.read_bytes() == payload.read_bytes()
+
+    # packing/unpacking with the same custom vocab must also round-trip
+    packed = tmp_path / "packed.tokz"
+    assert _run("pack", str(packed), str(payload), "--vocab", str(vocab)).returncode == 0
+    out_dir = tmp_path / "vout"
+    assert _run("unpack", str(packed), str(out_dir), "--vocab", str(vocab)).returncode == 0
+    assert (out_dir / "0000.rec").read_bytes() == payload.read_bytes()
+
+
+def test_cli_tokenize_stats(tmp_path):
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("the quick brown fox jumps over the lazy dog\n" * 50)
+
+    res = _run("tokenize-stats", str(corpus))
+    assert res.returncode == 0, res.stderr
+    assert "tokens:" in res.stdout
+    assert "adjacent MI" in res.stdout

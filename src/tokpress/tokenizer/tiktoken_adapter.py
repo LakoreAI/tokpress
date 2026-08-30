@@ -1,6 +1,6 @@
-"""Tokenizer engine backed by the public `tiktoken` library (OpenAI's BPE tokenizer), used by the "tiktoken" vocab mode. It has no pretrained baked rANS tables or shared cross-record LZ dictionary -- see profiles.py.
+"""Tokenizer engine backed by the public `tiktoken` library (OpenAI's BPE tokenizer). It can use either the released `o200k_base` encoding or a custom byte-level BPE vocabulary trained by `tokpress train-vocab` (tokenizer/bpe_trainer.py).
 
-tiktoken's public API (`Encoding.encode`) takes `str`, not arbitrary `bytes` -- but TokPress compresses arbitrary byte records, which are not always valid UTF-8 (e.g. a lone 0xFF byte). tiktoken's own byte-level BPE core operates on bytes internally, and exposes it via `Encoding._encode_bytes` (private, but the standard way tiktoken itself handles non-UTF-8 input -- e.g. via ftfy/surrogate handling in `encode()`) paired with the public `Encoding.decode_bytes`. Using that pair gives us exact, lossless byte-level roundtrip for arbitrary binary input, not just text.
+tiktoken's public API (`Encoding.encode`) takes `str`, not arbitrary `bytes` -- but TokPress compresses arbitrary byte records, which are not always valid UTF-8 (e.g. a lone 0xFF byte). tiktoken's own byte-level BPE core operates on bytes internally, and exposes it via `Encoding._encode_bytes` (private, but the standard way tiktoken itself handles non-UTF-8 input -- e.g. via ftfy/surrogate handling in `encode()`) paired with the public `Encoding.decode_bytes`. Using that pair gives us exact, lossless byte-level roundtrip for arbitrary binary input, not just text. This holds for any valid `mergeable_ranks` (all 256 bytes present, transitively-complete merge chain), which is exactly what bpe_trainer.py produces.
 """
 
 import tiktoken
@@ -9,9 +9,13 @@ DEFAULT_ENCODING_NAME = "o200k_base"
 
 
 class TiktokenTokenizer:
-    def __init__(self, encoding_name: str = DEFAULT_ENCODING_NAME) -> None:
-        self._enc = tiktoken.get_encoding(encoding_name)
-        self.name = encoding_name
+    def __init__(self, encoding_name: str = DEFAULT_ENCODING_NAME, encoding: object | None = None) -> None:
+        if encoding is not None:
+            self._enc = encoding
+            self.name = getattr(encoding, "name", encoding_name)
+        else:
+            self._enc = tiktoken.get_encoding(encoding_name)
+            self.name = encoding_name
         self.n_vocab = self._enc.n_vocab
         # A sentinel value above every real token id this encoding can
         # produce, used by TokenLZMatch as the escape/match marker -- see

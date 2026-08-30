@@ -34,3 +34,35 @@ def test_file_api_accepts_dictionary(tmp_path):
 
     res = tokpress.benchmark(str(src), dictionary=d)
     assert res["lossless"]
+
+
+def test_tokenize_stats_shape_and_invariants():
+    data = b'{"user": "u1", "action": "click"}\n' * 20
+    s = tokpress.tokenize_stats(data)
+
+    assert s["bytes"] == len(data)
+    assert s["tokens"] > 0
+    assert s["unique_tokens"] <= s["tokens"]
+    assert s["entropy_bits_per_token"] >= 0.0
+    # H0 >= H1 >= 0, so MI = H0 - H1 >= 0
+    assert s["adjacent_mutual_info_bits_per_token"] >= 0.0
+    assert s["entropy_bits_per_token"] >= s["cond_entropy_bits_per_token"]
+    assert s["entropy_bits_per_byte"] == s["entropy_bits_per_token"] / s["bytes_per_token"]
+
+
+def test_tokenize_stats_empty():
+    s = tokpress.tokenize_stats(b"")
+    assert s["tokens"] == 0
+    assert s["entropy_bits_per_token"] == 0.0
+
+
+def test_tokenize_stats_with_custom_vocab(tmp_path):
+    from tokpress.tokenizer import bpe_trainer
+    from tokpress.tokenizer.tiktoken_adapter import TiktokenTokenizer
+
+    corpus = b'{"user": "u1", "action": "click"}\n' * 200
+    ranks = bpe_trainer.train_mergeable_ranks(corpus, 1024)
+    tt = TiktokenTokenizer(encoding=bpe_trainer.build_tiktoken_encoding(ranks))
+    s = tokpress.tokenize_stats(corpus, tokenizer=tt)
+    assert s["tokens"] > 0
+    assert s["bytes"] == len(corpus)

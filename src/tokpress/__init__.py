@@ -6,6 +6,7 @@ from .core import (
     decompress,
     decompress_file,
     decompress_many,
+    tokenize_stats,
 )
 from .dictionary import TokDict
 
@@ -19,5 +20,6 @@ __all__ = [
     "compress_many",
     "decompress_many",
     "benchmark",
+    "tokenize_stats",
     "TokDict",
 ]

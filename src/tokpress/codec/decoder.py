@@ -19,8 +19,8 @@ from .token_lz import TokenLZMatch
 
 
 class TokPressDecoder:
-    def __init__(self, dictionary: TokDict | None = None) -> None:
-        self.tokenizer = TiktokenTokenizer()
+    def __init__(self, dictionary: TokDict | None = None, tokenizer: TiktokenTokenizer | None = None) -> None:
+        self.tokenizer = tokenizer if tokenizer is not None else TiktokenTokenizer()
         self._lz = TokenLZMatch(match_flag=self.tokenizer.match_flag)
         self.dictionary = dictionary
 
