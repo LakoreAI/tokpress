@@ -83,3 +83,58 @@ def test_batch_truncated_header_raises():
     compressed = tokpress.compress_many(records)
     with pytest.raises(Exception):
         tokpress.decompress_many(compressed[:8])
+
+
+def test_indexed_batch_roundtrip():
+    rng = random.Random(5)
+    records = [os.urandom(rng.randrange(1, 300)) for _ in range(25)]
+    packed = tokpress.indexed_compress(records)
+    assert tokpress.indexed_decompress(packed) == records
+    # decompress_many accepts an indexed batch too
+    assert tokpress.decompress_many(packed) == records
+
+
+def test_indexed_read_random_access():
+    rng = random.Random(6)
+    records = [os.urandom(rng.randrange(1, 300)) for _ in range(40)]
+    packed = tokpress.indexed_compress(records)
+    for i in [0, 1, 17, 39]:
+        assert tokpress.indexed_read(packed, i) == records[i]
+    with pytest.raises(IndexError):
+        tokpress.indexed_read(packed, 40)
+    with pytest.raises(IndexError):
+        tokpress.indexed_read(packed, -1)
+
+
+def test_indexed_batch_writer_streams():
+    w = tokpress.IndexedBatchWriter()
+    records = []
+    for i in range(30):
+        rec = f'{{"user": "u{i}", "action": "click", "ts": {1700000000 + i}}}'.encode()
+        w.add(rec)
+        records.append(rec)
+    packed = w.finish()
+    assert tokpress.indexed_decompress(packed) == records
+    assert tokpress.indexed_read(packed, 15) == records[15]
+
+
+def test_indexed_batch_with_dictionary():
+    train = _json_records(30)
+    d = TokDict.train(train)
+    records = _json_records(20, start=1000)
+    packed = tokpress.indexed_compress(records, dictionary=d)
+    assert tokpress.indexed_decompress(packed, dictionary=d) == records
+    for i in range(20):
+        assert tokpress.indexed_read(packed, i, dictionary=d) == records[i]
+
+
+def test_indexed_batch_empty():
+    packed = tokpress.indexed_compress([])
+    assert tokpress.indexed_decompress(packed) == []
+    with pytest.raises(IndexError):
+        tokpress.indexed_read(packed, 0)
+
+
+def test_indexed_batch_corrupt_header_raises():
+    with pytest.raises(Exception):
+        tokpress.indexed_read(b"TOKBI\x01", 0)

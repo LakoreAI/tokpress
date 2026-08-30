@@ -97,7 +97,12 @@ class TokDict:
         return self.stats.alphabet_size - 1
 
     @classmethod
-    def train(cls, samples: list[bytes], max_priming_tokens: int = 8192) -> "TokDict":
+    def train(
+        cls,
+        samples: list[bytes],
+        max_priming_tokens: int = 8192,
+        tokenizer: TiktokenTokenizer | None = None,
+    ) -> "TokDict":
         if not samples:
             raise ValueError("TokDict.train needs at least one sample record")
 
@@ -106,7 +111,7 @@ class TokDict:
         # module-level import here would be circular.
         from .codec.token_lz import TokenLZMatch
 
-        tokenizer = TiktokenTokenizer()
+        tokenizer = tokenizer if tokenizer is not None else TiktokenTokenizer()
         lz = TokenLZMatch(match_flag=tokenizer.match_flag)
         real_alphabet_size = tokenizer.match_flag + 1
         escape_symbol = real_alphabet_size  # one slot past the real token range

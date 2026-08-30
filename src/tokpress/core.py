@@ -14,6 +14,8 @@ _codec: TokPressCodec | None = None
 
 _BATCH_MAGIC = b"TOKB"
 _BATCH_VERSION = 1
+_INDEXED_MAGIC = b"TOKBI"
+_INDEXED_VERSION = 1
 
 
 def _codec_for(dictionary: TokDict | None, tokenizer: TiktokenTokenizer | None) -> TokPressCodec:
@@ -79,8 +81,10 @@ def decompress_many(
     tokenizer: TiktokenTokenizer | None = None,
 ) -> list[bytes]:
     """Inverse of compress_many: returns the original records byte-exact. A
-    plain single-record TokPress stream is also accepted (returns it as a
-    one-element list)."""
+    plain single-record TokPress stream (returns it as a one-element list) or
+    an indexed batch (TOKBI, see indexed_compress) is also accepted."""
+    if compressed_data.startswith(_INDEXED_MAGIC):
+        return indexed_decompress(compressed_data, dictionary=dictionary, tokenizer=tokenizer)
     if not compressed_data.startswith(_BATCH_MAGIC):
         return [decompress(compressed_data, dictionary=dictionary, tokenizer=tokenizer)]
 
@@ -208,3 +212,104 @@ def tokenize_stats(data: bytes, tokenizer: TiktokenTokenizer | None = None) -> d
         "adjacent_mutual_info_bits_per_token": h0 - h1,
         "entropy_bits_per_byte": h0 / fert if fert else 0.0,
     }
+
+
+def _parse_indexed_header(compressed_data: bytes) -> tuple[int, int, list[int], int]:
+    """Parse a TOKBI header: returns (n_records, body_size, offsets, body_start)."""
+    if not compressed_data.startswith(_INDEXED_MAGIC):
+        raise ValueError("not an indexed batch stream (bad TOKBI magic)")
+    if len(compressed_data) < 14:
+        raise ValueError("corrupt indexed batch: header truncated")
+    n_records = int.from_bytes(compressed_data[6:10], "little")
+    body_size = int.from_bytes(compressed_data[10:14], "little")
+    body_start = 14 + 4 * n_records
+    if body_start > len(compressed_data) or body_size > len(compressed_data) - body_start:
+        raise ValueError("corrupt indexed batch: header/body size mismatch")
+    offsets = [int.from_bytes(compressed_data[14 + 4 * i : 18 + 4 * i], "little") for i in range(n_records)]
+    return n_records, body_size, offsets, body_start
+
+
+class IndexedBatchWriter:
+    """Streaming indexed-batch writer: add records one at a time, finish()
+    returns the TOKBI container. Each record is a self-contained TokPress
+    stream with a byte offset in the header, so any record can be decoded
+    independently (see indexed_read) -- at the cost of per-record framing
+    (use compress_many for the best-ratio whole-batch adaptive stream)."""
+
+    def __init__(
+        self,
+        dictionary: TokDict | None = None,
+        tokenizer: TiktokenTokenizer | None = None,
+    ) -> None:
+        self._codec = TokPressCodec(dictionary=dictionary, tokenizer=tokenizer)
+        self._compressed: list[bytes] = []
+        self._body_size = 0
+
+    def add(self, record: bytes) -> None:
+        c = self._codec.compress(record)
+        self._compressed.append(c)
+        self._body_size += len(c)
+
+    def add_many(self, records) -> None:
+        for record in records:
+            self.add(record)
+
+    def finish(self) -> bytes:
+        w = BitWriter()
+        for b in _INDEXED_MAGIC:
+            w.write_byte(b)
+        w.write_byte(_INDEXED_VERSION)
+        w.write_uint32(len(self._compressed))
+        w.write_uint32(self._body_size)
+        offset = 0
+        for c in self._compressed:
+            w.write_uint32(offset)
+            offset += len(c)
+        w.flush()
+        return w.getvalue() + b"".join(self._compressed)
+
+
+def indexed_compress(
+    records: list[bytes],
+    dictionary: TokDict | None = None,
+    tokenizer: TiktokenTokenizer | None = None,
+) -> bytes:
+    """Compress many records as a TOKBI indexed batch: each record is a
+    self-contained stream with a byte offset in the header, so any record can
+    be decoded on its own. Unlike compress_many (one adaptive stream over the
+    whole batch, best ratio), this trades a little per-record framing cost for
+    random access and streaming."""
+    w = IndexedBatchWriter(dictionary=dictionary, tokenizer=tokenizer)
+    w.add_many(records)
+    return w.finish()
+
+
+def indexed_decompress(
+    compressed_data: bytes,
+    dictionary: TokDict | None = None,
+    tokenizer: TiktokenTokenizer | None = None,
+) -> list[bytes]:
+    """Decode every record of a TOKBI indexed batch, byte-exact."""
+    n_records, body_size, offsets, body_start = _parse_indexed_header(compressed_data)
+    records = []
+    for i in range(n_records):
+        start = body_start + offsets[i]
+        end = body_start + (offsets[i + 1] if i + 1 < n_records else body_size)
+        records.append(decompress(compressed_data[start:end], dictionary=dictionary, tokenizer=tokenizer))
+    return records
+
+
+def indexed_read(
+    compressed_data: bytes,
+    index: int,
+    dictionary: TokDict | None = None,
+    tokenizer: TiktokenTokenizer | None = None,
+) -> bytes:
+    """Decode a single record of a TOKBI indexed batch in O(1) -- no other
+    record is decoded. Raises IndexError for an out-of-range index."""
+    n_records, body_size, offsets, body_start = _parse_indexed_header(compressed_data)
+    if not 0 <= index < n_records:
+        raise IndexError(f"index {index} out of range for {n_records} records")
+    start = body_start + offsets[index]
+    end = body_start + (offsets[index + 1] if index + 1 < n_records else body_size)
+    return decompress(compressed_data[start:end], dictionary=dictionary, tokenizer=tokenizer)

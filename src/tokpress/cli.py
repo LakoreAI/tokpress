@@ -14,12 +14,14 @@ BANNER = "TokPress -- pure-Python tiktoken-driven compression"
 HELP_TEXT = """Usage:
   tokpress compress <input_path> [-o <output.tokz>] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
   tokpress decompress <input.tokz> [-o <output_path>] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
-  tokpress pack <output.tokz> <record_path> [record_path ...] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
+  tokpress pack <output.tokz> <record_path> [record_path ...] [--dict <dict.tokdict>] [--vocab <vocab.ranks>] [--indexed]
   tokpress unpack <input.tokz> <out_dir> [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
+  tokpress read <indexed.tokz> <index> [-o <output_path>] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
   tokpress bench <input_path>
   tokpress tokenize-stats <input_path> [--vocab <vocab.ranks>]
   tokpress train-dict <output.tokdict> <sample_path> [sample_path ...]
   tokpress train-vocab <output.ranks> <corpus_path> [corpus_path ...] [--vocab-size N] [--max-bytes N]
+  tokpress fit <out_prefix> <corpus_path> [corpus_path ...] [--vocab-size N] [--max-bytes N]
 
 Options:
   -o, --output <PATH>     Specify output filepath
@@ -35,6 +37,9 @@ Options:
 pack/unpack: batch-compress many independent records as one stream (each
 <record_path> is one record), so the entropy model adapts across records --
 far smaller than per-record compression on many small homogeneous records.
+With --indexed, pack writes a TOKBI indexed batch (per-record framing +
+byte offsets) instead: any record can be decoded on its own with `read`
+(in O(1), no other record decoded), and unpack/read accept TOKB/TOKBI/TOKZ.
 
 tokenize-stats: report tokenizer-quality statistics (tokens/KB, order-0 and
 order-1 entropy, adjacent-token mutual information) -- compression is a
@@ -47,6 +52,11 @@ line into individual records; any other file is treated as one record.
 train-vocab: learns a byte-level BPE vocabulary from the corpus files and
 writes a valid merge chain usable by --vocab. Correctness-first trainer,
 meant for a sampled corpus (see --max-bytes).
+
+fit: train-vocab + train-dict in one step -- writes <out_prefix>.ranks and
+<out_prefix>.tokdict, with the dictionary trained on the custom vocabulary
+(not o200k_base). Use both with --vocab <out_prefix>.ranks --dict
+<out_prefix>.tokdict on compress/decompress/pack/unpack.
 """
 
 
@@ -68,24 +78,30 @@ def _parse_flags(args: list[str], start: int) -> dict:
         elif args[i] == "--vocab" and i + 1 < len(args):
             flags["vocab"] = args[i + 1]
             i += 2
+        elif args[i] == "--indexed":
+            flags["indexed"] = True
+            i += 1
         else:
             i += 1
     return flags
 
 
-_FLAG_TOKENS = ("-o", "--output", "--dict", "--vocab", "--vocab-size", "--max-bytes")
+_FLAG_TOKENS = ("-o", "--output", "--dict", "--vocab", "--vocab-size", "--max-bytes", "--indexed")
 
 
 def _parse_positional(args: list[str], start: int) -> list[str]:
     """Return the positional (non-flag) tokens from args[start:], skipping
-    flag names and their value tokens."""
+    flag names and their value tokens. --indexed is a value-less flag."""
     positional = []
     i = start
     while i < len(args):
-        if args[i] in _FLAG_TOKENS and i + 1 < len(args):
+        tok = args[i]
+        if tok == "--indexed":
+            i += 1
+        elif tok in _FLAG_TOKENS and i + 1 < len(args):
             i += 2
         else:
-            positional.append(args[i])
+            positional.append(tok)
             i += 1
     return positional
 
@@ -250,7 +266,10 @@ def cmd_pack(args: list[str]) -> int:
             records.append(f.read())
 
     t0 = time.perf_counter()
-    compressed = core.compress_many(records, dictionary=dictionary, tokenizer=tokenizer)
+    if flags.get("indexed"):
+        compressed = core.indexed_compress(records, dictionary=dictionary, tokenizer=tokenizer)
+    else:
+        compressed = core.compress_many(records, dictionary=dictionary, tokenizer=tokenizer)
     elapsed = time.perf_counter() - t0
 
     with open(output_path, "wb") as f:
@@ -292,6 +311,69 @@ def cmd_unpack(args: list[str]) -> int:
 
     print(f"Unpacked: {out_dir} ({len(records)} records)")
     print(f"  time:     {elapsed * 1000:.2f} ms")
+    return 0
+
+
+def cmd_fit(args: list[str]) -> int:
+    """train-vocab + train-dict in one step: writes <out_prefix>.ranks and
+    <out_prefix>.tokdict, with the dictionary trained on the custom
+    vocabulary (not o200k_base)."""
+    if len(args) < 4:
+        print("Error: usage: tokpress fit <out_prefix> <corpus_path> [corpus_path ...]")
+        print_help()
+        return 1
+    out_prefix = args[2]
+
+    vocab_size = 4096
+    max_bytes = 256 * 1024
+    corpus_paths = _parse_positional(args, 3)
+    if "--vocab-size" in args or "--max-bytes" in args:
+        i = 3
+        while i < len(args):
+            if args[i] == "--vocab-size" and i + 1 < len(args):
+                vocab_size = int(args[i + 1])
+                i += 2
+            elif args[i] == "--max-bytes" and i + 1 < len(args):
+                max_bytes = int(args[i + 1])
+                i += 2
+            else:
+                i += 1
+    if not corpus_paths:
+        print("Error: no corpus paths given")
+        print_help()
+        return 1
+
+    records = []
+    for path in corpus_paths:
+        records.extend(_load_sample_records(path))
+    if not records:
+        print("Error: no records read from the corpus")
+        return 1
+
+    ranks_path = out_prefix + ".ranks"
+    tokdict_path = out_prefix + ".tokdict"
+
+    t0 = time.perf_counter()
+    corpus = bpe_trainer.sample_corpus(b"".join(records), max_bytes)
+    ranks = bpe_trainer.train_mergeable_ranks(corpus, vocab_size)
+    if not bpe_trainer.validate_mergeable_ranks(ranks):
+        print("Error: trained vocabulary failed merge-chain validation")
+        return 1
+    bpe_trainer.dump_rank_file(ranks, ranks_path)
+    tokenizer = TiktokenTokenizer(encoding=bpe_trainer.build_tiktoken_encoding(ranks, name=ranks_path))
+
+    dictionary = TokDict.train(records, tokenizer=tokenizer)
+    dictionary.save(tokdict_path)
+    elapsed = time.perf_counter() - t0
+
+    n_active = sum(1 for f in dictionary.stats.freq if f > 0)
+    print(f"Fitted <prefix>.ranks / <prefix>.tokdict: {out_prefix}")
+    print(f"  records:          {len(records)}")
+    print(f"  vocab tokens:     {len(ranks)}")
+    print(f"  priming tokens:   {len(dictionary.priming_tokens)}")
+    print(f"  dict table sym:   {n_active}")
+    print(f"  time:             {elapsed:.2f}s")
+    print(f"  use both with: --vocab {ranks_path} --dict {tokdict_path}")
     return 0
 
 
@@ -378,6 +460,38 @@ def cmd_tokenize_stats(args: list[str]) -> int:
     return 0
 
 
+def cmd_read(args: list[str]) -> int:
+    if len(args) < 4:
+        print("Error: usage: tokpress read <indexed.tokz> <index> [-o <output_path>] [--dict ...] [--vocab ...]")
+        print_help()
+        return 1
+    input_path = args[2]
+    try:
+        index = int(args[3])
+    except ValueError:
+        print(f"Error: invalid record index: {args[3]}")
+        return 1
+    flags = _parse_flags(args, 4)
+    output_path = flags.get("output")
+    dictionary = TokDict.load(flags["dict"]) if "dict" in flags else None
+    tokenizer = _load_tokenizer(flags.get("vocab"))
+
+    with open(input_path, "rb") as f:
+        compressed = f.read()
+
+    t0 = time.perf_counter()
+    record = core.indexed_read(compressed, index, dictionary=dictionary, tokenizer=tokenizer)
+    elapsed = time.perf_counter() - t0
+
+    if output_path is not None:
+        with open(output_path, "wb") as f:
+            f.write(record)
+    else:
+        sys.stdout.buffer.write(record)
+    print(f"Record {index}: {len(record)} bytes ({elapsed * 1000:.2f} ms)", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = ["tokpress"] + list(argv) if argv is not None else sys.argv
 
@@ -394,6 +508,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_pack(args)
     elif cmd == "unpack":
         return cmd_unpack(args)
+    elif cmd == "read":
+        return cmd_read(args)
     elif cmd in ("bench", "b"):
         return cmd_bench(args)
     elif cmd == "tokenize-stats":
@@ -402,6 +518,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_train_dict(args)
     elif cmd == "train-vocab":
         return cmd_train_vocab(args)
+    elif cmd == "fit":
+        return cmd_fit(args)
     elif cmd in ("help", "--help", "-h"):
         print_help()
         return 0

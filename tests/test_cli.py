@@ -150,3 +150,55 @@ def test_cli_tokenize_stats(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "tokens:" in res.stdout
     assert "adjacent MI" in res.stdout
+
+
+def test_cli_pack_indexed_and_read(tmp_path):
+    """pack --indexed writes a TOKBI batch; `read` fetches any single record
+    without decoding the others."""
+    records = [f'{{"user": "u{i}", "action": "click"}}'.encode() for i in range(20)]
+    rec_paths = []
+    for i, rec in enumerate(records):
+        p = tmp_path / f"r{i}.json"
+        p.write_bytes(rec)
+        rec_paths.append(str(p))
+
+    packed = tmp_path / "batch.tokz"
+    res = _run("pack", str(packed), *rec_paths, "--indexed")
+    assert res.returncode == 0, res.stderr
+    assert packed.read_bytes().startswith(b"TOKBI")
+
+    for i in [0, 7, 19]:
+        out = tmp_path / f"r{i}.out"
+        assert _run("read", str(packed), str(i), "-o", str(out)).returncode == 0
+        assert out.read_bytes() == records[i]
+
+    # unpack also reads the indexed batch back in full
+    out_dir = tmp_path / "out"
+    assert _run("unpack", str(packed), str(out_dir)).returncode == 0
+    for i, rec in enumerate(records):
+        assert (out_dir / f"{i:04d}.rec").read_bytes() == rec
+
+
+def test_cli_fit(tmp_path):
+    """fit trains a vocab + dict end-to-end on a corpus; both work together."""
+    corpus = tmp_path / "corpus.jsonl"
+    lines = [f'{{"user": "u{i}", "action": "click", "ts": {1700000000 + i}}}' for i in range(120)]
+    corpus.write_text("\n".join(lines) + "\n")
+
+    prefix = str(tmp_path / "fit")
+    res = _run("fit", prefix, str(corpus), "--vocab-size", "1024")
+    assert res.returncode == 0, res.stderr
+    assert "Fitted" in res.stdout
+    ranks = tmp_path / "fit.ranks"
+    tokdict = tmp_path / "fit.tokdict"
+    assert ranks.is_file() and tokdict.is_file()
+
+    payload = tmp_path / "rec.json"
+    payload.write_text('{"user": "u999", "action": "click", "ts": 1700000999}')
+    tokz = tmp_path / "rec.tokz"
+    out = tmp_path / "rec.out"
+    assert (
+        _run("compress", str(payload), "-o", str(tokz), "--vocab", str(ranks), "--dict", str(tokdict)).returncode == 0
+    )
+    assert _run("decompress", str(tokz), "-o", str(out), "--vocab", str(ranks), "--dict", str(tokdict)).returncode == 0
+    assert out.read_bytes() == payload.read_bytes()

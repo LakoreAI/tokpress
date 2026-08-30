@@ -7,16 +7,15 @@ many-small-independent-records regime.
 No cherry-picking (AGENT.md): every backend that can run, runs, on every
 corpus; results print as-is, including where TokPress loses.
 
-Corpora are NOT vendored into this repo yet (see docs/TODO.md) -- this
-script reads them from a sibling `tokenzip` checkout if present, and
-prints SKIPPED for anything missing rather than substituting synthetic
-data.
+Corpora are vendored in this repo under `data/bench/` (see
+`data/bench/README.md`); anything missing -- the optional long-text corpora
+in `data/bench/long_text/` -- prints SKIPPED rather than substituting
+synthetic data.
 """
 
 import bz2
 import gzip
 import lzma
-import os
 import re
 import statistics
 import subprocess
@@ -37,35 +36,32 @@ from tokpress import compress_many, decompress_many  # noqa: E402
 from tokpress.codec.decoder import TokPressDecoder  # noqa: E402
 from tokpress.codec.encoder import TokPressEncoder  # noqa: E402
 from tokpress.dictionary import TokDict  # noqa: E402
+from tokpress.tokenizer import bpe_trainer  # noqa: E402
 from tokpress.tokenizer.tiktoken_adapter import TiktokenTokenizer  # noqa: E402
 
-TOKENZIP_ROOT = REPO_ROOT.parent / "tokenzip"
-LONG_TEXT_ROOT = Path(
-    os.environ.get(
-        "TOKPRESS_LONG_TEXT_CORPUS_DIR",
-        "/tmp/claude-1000/-home-octoopt-workspace-projects-lakoreai-tokpress/"
-        "4f2885ac-414b-4df4-bf95-27257e285dda/scratchpad/corpus",
-    )
-)
+DATA_ROOT = REPO_ROOT / "data" / "bench"
+CANTERBURY = DATA_ROOT / "canterbury"
+REAL_DATA = DATA_ROOT / "real_data"
+LONG_TEXT = DATA_ROOT / "long_text"
 REPEATS = 3
 
 CORPORA = {
-    "prose (alice29.txt, Canterbury Corpus)": TOKENZIP_ROOT / "data/canterbury/alice29.txt",
-    "code (fields.c, Canterbury Corpus)": TOKENZIP_ROOT / "data/canterbury/fields.c",
-    "code (real_python_code.py)": TOKENZIP_ROOT / "benchmarks/real_data/real_python_code.py",
-    "json logs (json_heldout.jsonl)": TOKENZIP_ROOT / "benchmarks/real_data/json_heldout.jsonl",
+    "prose (alice29.txt, Canterbury Corpus)": CANTERBURY / "alice29.txt",
+    "code (fields.c, Canterbury Corpus)": CANTERBURY / "fields.c",
+    "code (real_python_code.py)": REAL_DATA / "real_python_code.py",
+    "json logs (json_heldout.jsonl)": REAL_DATA / "json_heldout.jsonl",
     # Long-text corpora (docs/TODO.md item 1): a standard compression-research
     # benchmark (enwik8, Wikipedia XML dump -- mattmahoney.net/dc/text.html,
     # the Hutter Prize / Large Text Compression Benchmark test set) and a
     # long, pure-prose public-domain novel (Project Gutenberg's War and
-    # Peace) -- both far longer than Canterbury's 152KB alice29.txt. Only
-    # small prefixes are used: this pure-Python codec's rANS stage does not
-    # scale to the full 100MB/3.3MB files in reasonable time (see
-    # docs/STATUS.md's "not optimized for speed").
-    "long text (enwik8 prefix, Wikipedia XML)": LONG_TEXT_ROOT / "enwik8_2mb.txt",
-    "long text (War and Peace prefix, Project Gutenberg)": LONG_TEXT_ROOT / "warpeace_1mb.txt",
+    # Peace). NOT vendored (see data/bench/README.md); missing files print
+    # SKIPPED. Only small prefixes are used: this pure-Python codec's rANS
+    # stage does not scale to the full 100MB/3.3MB files in reasonable time
+    # (see docs/STATUS.md's "not optimized for speed").
+    "long text (enwik8 prefix, Wikipedia XML)": LONG_TEXT / "enwik8_2mb.txt",
+    "long text (War and Peace prefix, Project Gutenberg)": LONG_TEXT / "warpeace_1mb.txt",
 }
-MANY_SMALL_RECORDS_PATH = TOKENZIP_ROOT / "benchmarks/real_data/small_records.jsonl"
+MANY_SMALL_RECORDS_PATH = REAL_DATA / "small_records.jsonl"
 
 # No package-metadata corpus is available in either checkout right now --
 # see docs/TODO.md. Not substituting synthetic data for it.
@@ -424,6 +420,32 @@ def run_trained_dictionary_regime(lines: list[bytes], split_frac: float = 0.7, l
     if BROTLI_AVAILABLE and not BROTLI_DICT_AVAILABLE:
         print(f"{'brotli_11+dict':<38} SKIPPED (brotli PyPI bindings lack custom-dictionary support)")
 
+    # Full stack: a custom domain BPE vocabulary (train-vocab) + a TokDict
+    # trained on that vocabulary, applied to the same held-out records as one
+    # adaptive batch stream. The vocab is trained only on the training split.
+    try:
+        vocab_corpus = bpe_trainer.sample_corpus(b"".join(train_records), 262144)
+        ranks = bpe_trainer.train_mergeable_ranks(vocab_corpus, 4096)
+        tt = TiktokenTokenizer(encoding=bpe_trainer.build_tiktoken_encoding(ranks))
+        d_custom = TokDict.train(train_records, tokenizer=tt)
+        result, times = _time_n(lambda: compress_many(test_records, dictionary=d_custom, tokenizer=tt))
+        ok = decompress_many(result, dictionary=d_custom, tokenizer=tt) == test_records
+        mean_ms = statistics.mean(times) * 1000
+        stdev_ms = statistics.stdev(times) * 1000 if len(times) > 1 else 0.0
+        print(
+            _row(
+                "tokpress+customvocab+dict+batch",
+                len(result),
+                len(result) / total_raw,
+                mean_ms,
+                stdev_ms,
+                ok,
+            )
+            + f"  (vocab {len(ranks)} tok, priming {len(d_custom.priming_tokens)})"
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"{'tokpress+customvocab+dict+batch':<38} ERROR: {e}")
+
 
 def run_paper_scale_dictionary_regime() -> None:
     """docs/research.tex (a predecessor system's paper) reports its final
@@ -432,7 +454,7 @@ def run_paper_scale_dictionary_regime() -> None:
     split on the current architecture gives the most directly comparable
     number available for docs/research.tex's claims.
     """
-    path = TOKENZIP_ROOT / "benchmarks/real_data/json_heldout.jsonl"
+    path = REAL_DATA / "json_heldout.jsonl"
     if not path.is_file():
         print(f"\n=== paper-scale dictionary regime: SKIPPED (corpus not found at {path}) ===")
         return
@@ -441,7 +463,7 @@ def run_paper_scale_dictionary_regime() -> None:
 
 
 def _code_snippet_records(min_size: int = 100, max_size: int = 2000) -> list[bytes]:
-    path = TOKENZIP_ROOT / "benchmarks/real_data/real_python_code.py"
+    path = REAL_DATA / "real_python_code.py"
     if not path.is_file():
         return []
     parts = re.split(r"\n(?=def |class )", path.read_text())
@@ -459,7 +481,7 @@ def run_cross_schema_generalization() -> None:
     against zstd with no dictionary / a wrong-schema dictionary / a
     matched-schema dictionary.
     """
-    json_path = TOKENZIP_ROOT / "benchmarks/real_data/json_heldout.jsonl"
+    json_path = REAL_DATA / "json_heldout.jsonl"
     if not json_path.is_file():
         print("\n=== cross-schema generalization: SKIPPED (json_heldout.jsonl not found) ===")
         return
@@ -531,8 +553,8 @@ def run_cross_schema_generalization() -> None:
 
 
 def main() -> None:
-    if not TOKENZIP_ROOT.is_dir():
-        print(f"Sibling tokenzip checkout not found at {TOKENZIP_ROOT} -- no corpora available.")
+    if not DATA_ROOT.is_dir():
+        print(f"Vendored corpus root not found at {DATA_ROOT} -- no corpora available.")
         return
     if not ZSTD_AVAILABLE:
         print("NOTE: `zstd` binary not found on PATH -- zstd rows will be skipped.\n")
