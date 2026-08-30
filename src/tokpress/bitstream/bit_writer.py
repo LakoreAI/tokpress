@@ -24,6 +24,9 @@ class BitWriter:
     def write_uint32(self, value: int) -> None:
         self.write_bits(value, 32)
 
+    def write_uint64(self, value: int) -> None:
+        self.write_bits(value, 64)
+
     def flush(self) -> None:
         if self._bit_count > 0:
             self._buf.append(self._bit_buf & 0xFF)

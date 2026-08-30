@@ -3,6 +3,7 @@ import string
 
 from tokpress.codec.decoder import TokPressDecoder
 from tokpress.codec.encoder import MODE_RANS_ADAPTIVE, MODE_RANS_SPARSE, TokPressEncoder
+from tokpress.entropy.rans import RANS_M
 
 _CHARS = string.ascii_letters + string.digits
 
@@ -22,20 +23,26 @@ def _json_like_payload(n_records: int) -> bytes:
 
 
 def test_sparse_mode_escape_path_roundtrips():
-    """A record with more than RANS_M=4096 distinct LZ-token values used to
-    make MODE_RANS_SPARSE unusable entirely (silent fallback to flat
-    bit-packing) -- this exercises the escape-symbol fix directly."""
+    """A record with more than RANS_M distinct LZ-token values used to make
+    MODE_RANS_SPARSE unusable entirely (silent fallback to flat
+    bit-packing) -- this exercises the escape-symbol fix directly, using
+    synthetic symbol ids rather than real tokenized text: RANS_M=65536 is
+    large enough that real text plateaus in distinct-token growth well
+    below it for any test-sized payload (measured: 100000 random words of
+    real characters only reached ~12000 distinct tokens)."""
     enc = TokPressEncoder()
     dec = TokPressDecoder()
-    payload = _random_word_payload(n_words=10000, word_len=10)
 
-    tokens = enc.tokenizer.encode(payload)
-    lz_tokens = enc._lz.encode(tokens, [])
-    assert len(set(lz_tokens)) > 4096  # sanity: this test must actually exercise the escape path
+    n_distinct = RANS_M + 500
+    lz_tokens = list(range(n_distinct)) + [5, 5, 5, 10, 10]  # a few repeats for realism
+    assert len(set(lz_tokens)) > RANS_M  # sanity: this test must actually exercise the escape path
 
-    compressed = enc._encode_rans_sparse(lz_tokens, len(payload))
+    compressed = enc._encode_rans_sparse(lz_tokens, n_raw=len(lz_tokens))
     assert compressed[5] == MODE_RANS_SPARSE
-    assert dec.decompress(compressed) == payload
+
+    expected_tokens = dec._lz.decode(lz_tokens, [])
+    expected_bytes = dec.tokenizer.decode(expected_tokens)
+    assert dec.decompress(compressed) == expected_bytes
 
 
 def test_adaptive_mode_roundtrips():
@@ -45,7 +52,7 @@ def test_adaptive_mode_roundtrips():
 
     tokens = enc.tokenizer.encode(payload)
     lz_tokens = enc._lz.encode(tokens, [])
-    assert len(set(lz_tokens)) <= 4096  # sanity: within MODE_RANS_ADAPTIVE's supported range
+    assert len(set(lz_tokens)) <= RANS_M  # sanity: within MODE_RANS_ADAPTIVE's supported range
     assert len(lz_tokens) >= 512
 
     compressed = enc._encode_rans_adaptive(lz_tokens, len(payload))

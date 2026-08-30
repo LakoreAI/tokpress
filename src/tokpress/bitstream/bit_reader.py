@@ -31,5 +31,8 @@ class BitReader:
     def read_uint32(self) -> int:
         return self.read_bits(32)
 
+    def read_uint64(self) -> int:
+        return self.read_bits(64)
+
     def has_more(self) -> bool:
         return self._byte_pos < len(self._data) or self._bit_count > 0

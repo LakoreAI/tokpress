@@ -55,7 +55,7 @@ class TokPressDecoder:
             num_escapes = r.read_uint32()
             escapes = [r.read_uint32() for _ in range(num_escapes)]
 
-            rans_state = r.read_uint32()
+            rans_state = r.read_uint64()
             num_words = r.read_uint32()
             words = [r.read_uint16() for _ in range(num_words)]
             dec = RansDecoder(rans_state, words)
@@ -75,7 +75,7 @@ class TokPressDecoder:
             active_indices = read_symbol_list(r)
             k = len(active_indices)
 
-            rans_state = r.read_uint32()
+            rans_state = r.read_uint64()
             num_words = r.read_uint32()
             words = [r.read_uint16() for _ in range(num_words)]
             dec = RansDecoder(rans_state, words)
@@ -113,7 +113,7 @@ class TokPressDecoder:
             num_escapes = r.read_uint32()
             escapes = [r.read_uint32() for _ in range(num_escapes)]
 
-            rans_state = r.read_uint32()
+            rans_state = r.read_uint64()
             num_words = r.read_uint32()
             words = [r.read_uint16() for _ in range(num_words)]
             dec = RansDecoder(rans_state, words)

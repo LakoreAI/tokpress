@@ -1,4 +1,4 @@
-from tokpress.entropy.frequency import SymbolStats
+from tokpress.entropy.frequency import RANS_M, SymbolStats
 from tokpress.entropy.rans import RansDecoder, RansEncoder
 
 
@@ -11,9 +11,9 @@ def _make_skewed_symbols():
 def test_symbol_stats_normalize_sums_to_rans_m():
     stats = SymbolStats(256)
     stats.count_symbols(_make_skewed_symbols())
-    assert stats.total_freq == 4096
-    assert stats.cum_freq[-1] == 4096
-    assert len(stats.slot_to_symbol) == 4096
+    assert stats.total_freq == RANS_M
+    assert stats.cum_freq[-1] == RANS_M
+    assert len(stats.slot_to_symbol) == RANS_M
 
 
 def test_rans_roundtrip_skewed_distribution():
@@ -34,7 +34,7 @@ def test_rans_roundtrip_single_symbol_alphabet():
     symbols = [7] * 1000
     stats = SymbolStats(16)
     stats.count_symbols(symbols)
-    assert stats.freq[7] == 4096
+    assert stats.freq[7] == RANS_M
 
     words: list[int] = []
     enc = RansEncoder()

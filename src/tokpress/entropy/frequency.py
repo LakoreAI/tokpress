@@ -1,6 +1,15 @@
-"""SymbolStats: frequency-table normalization (scaling raw counts to RANS_M=4096 total, with a round-robin rounding-drift fixup) plus the decode lookup table. Encoder and decoder must derive bit-identical tables from the same symbol counts -- rANS is not fault-tolerant to a divergent table."""
+"""SymbolStats: frequency-table normalization (scaling raw counts to RANS_M total, with a round-robin rounding-drift fixup) plus the decode lookup table. Encoder and decoder must derive bit-identical tables from the same symbol counts -- rANS is not fault-tolerant to a divergent table.
 
-RANS_M = 4096
+RANS_M_BITS/RANS_M are defined here (not in entropy/rans.py) because rans.py
+already imports SymbolStats from this module -- this is the one direction
+that avoids a circular import, and it makes this module the single source of
+truth for the table-log (rans.py derives RANS_L from RANS_M rather than
+maintaining its own independent copy, which used to silently risk drifting
+out of sync -- both entropy/rans.py's *and* this module's RANS_M happened to
+be hardcoded to the same 4096 value in two separate places)."""
+
+RANS_M_BITS = 16
+RANS_M = 1 << RANS_M_BITS  # 65536
 
 
 def _find_context_index(context_ids: list[int], ctx: int) -> int:

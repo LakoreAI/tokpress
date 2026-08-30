@@ -13,11 +13,12 @@ dictionary.py -- carries only an 8-byte fingerprint instead of a per-record
 freq table), MODE_RANS_ADAPTIVE=4 (chunked, cumulative-history rANS -- see
 _encode_rans_adaptive below).
 
-The raw-tokens candidate is always built; the rANS-sparse and rANS-adaptive
-candidates are only built (and only win if smaller) when the record's
-distinct-symbol count fits within RANS_M=4096 -- every active symbol needs
-frequency >= 1, so a record with more distinct symbols than that can never
-be rebalanced to sum to RANS_M (see entropy/frequency.py's count_symbols).
+The raw-tokens candidate is always built; the rANS-adaptive candidate is
+only built (and only wins if smaller) when the record's distinct-symbol
+count fits within RANS_M (table-log 16, RANS_M=65536) -- every active
+symbol needs frequency >= 1, so a record with more distinct symbols than
+that can never be rebalanced to sum to RANS_M (see entropy/frequency.py's
+count_symbols). rANS-sparse has no such limit (see its own docstring).
 The rANS-dict candidate is only built when a TokDict was supplied. Both
 sparse-table modes transmit the active-symbol-id list as sorted delta +
 varint (see bitstream/varint.py) rather than fixed 4-byte ids, since
@@ -44,11 +45,25 @@ MODE_RANS_ADAPTIVE = 4
 # against a table built purely from already-processed chunks (Laplace-smoothed),
 # so it costs zero transmitted table bytes. Only worth attempting on records long
 # enough to have several chunks' worth of history to adapt from. Smaller chunks
-# adapt faster (measured 5-16% smaller than the largest chunk size tried on real
-# corpora) at the cost of more per-chunk table-rebuild work; 256 was the best
-# tradeoff measured before returns flattened out.
-ADAPTIVE_CHUNK_SIZE = 256
+# adapt faster (measured 5-16% smaller than the largest chunk size tried on
+# small-vocabulary real corpora) at the cost of more per-chunk table-rebuild
+# work -- each chunk boundary costs O(k) (k = distinct local symbols), so
+# total cost is ~(n/chunk_size)*k. ADAPTIVE_MIN_CHUNK=256 was the best
+# tradeoff measured when RANS_M_BITS=12 capped k at 4096; now that RANS_M is
+# much larger, long/diverse text can push k into the tens of thousands, and a
+# fixed chunk_size=256 there means (n/256)*k blows up (measured: 46.6s for a
+# 2MB file at k=32739, vs 1.2s at chunk_size=16384 for a ratio only ~1.5%
+# worse). _adaptive_chunk_size below scales chunk_size with n*k to keep total
+# per-chunk-rebuild work roughly bounded regardless of file size or
+# vocabulary size, while leaving small-vocabulary records at the
+# small-chunk/best-ratio end of that tradeoff.
+ADAPTIVE_MIN_CHUNK = 256
+ADAPTIVE_WORK_BUDGET = 2_000_000
 ADAPTIVE_MIN_SYMBOLS = 512
+
+
+def _adaptive_chunk_size(n: int, k: int) -> int:
+    return max(ADAPTIVE_MIN_CHUNK, (n * k) // ADAPTIVE_WORK_BUDGET)
 
 
 class TokPressEncoder:
@@ -100,16 +115,18 @@ class TokPressEncoder:
         return w.getvalue()
 
     def _encode_rans_sparse(self, lz_tokens: list[int], n_raw: int) -> bytes:
-        """Order-0 rANS with an escape symbol for the long tail: a record's
-        distinct-symbol count must fit within RANS_M=4096 for a single table
-        (see entropy/frequency.py's count_symbols), but real text easily
-        exceeds that -- alice29.txt's 4272 distinct symbols is a small
-        example. Rather than gate this mode out entirely (which used to
-        silently fall back to no entropy coding at all -- MODE_RAW_TOKENS'
-        flat bit-packing), keep only the RANS_M-1 most frequent symbols in
-        the table and route everything else through a reserved escape
-        symbol, exactly like dictionary.py's TokDict. Always structurally
-        valid; whether it wins is decided purely by final size.
+        """Order-0 rANS with an escape symbol for the long tail: a single
+        table can only hold RANS_M distinct symbols (see
+        entropy/frequency.py's count_symbols), and long/lexically diverse
+        text can still exceed even RANS_M=65536 (e.g. a large document with
+        a very rich vocabulary). Rather than gate this mode out entirely
+        (which used to silently fall back to no entropy coding at all --
+        MODE_RAW_TOKENS' flat bit-packing -- for any record over the line,
+        including ordinary prose at the old RANS_M=4096), keep only the
+        RANS_M-1 most frequent symbols in the table and route everything
+        else through a reserved escape symbol, exactly like dictionary.py's
+        TokDict. Always structurally valid; whether it wins is decided
+        purely by final size.
         """
         real_alphabet_size = self.tokenizer.match_flag + 1
         escape_symbol = real_alphabet_size
@@ -156,7 +173,7 @@ class TokPressEncoder:
         w.write_uint32(len(escapes))
         for sym in escapes:
             w.write_uint32(sym)
-        w.write_uint32(enc.state)
+        w.write_uint64(enc.state)
         w.write_uint32(len(words))
         for word in words:
             w.write_uint16(word)
@@ -178,10 +195,11 @@ class TokPressEncoder:
         local_index = {sym: i for i, sym in enumerate(active_indices)}
         k = len(active_indices)
         n = len(lz_tokens)
+        chunk_size = _adaptive_chunk_size(n, k)
 
         cum_counts = [1] * k
         cum_total = k
-        chunk_bounds = list(range(0, n, ADAPTIVE_CHUNK_SIZE)) + [n]
+        chunk_bounds = list(range(0, n, chunk_size)) + [n]
 
         chunk_stats: list[SymbolStats] = []
         for c in range(len(chunk_bounds) - 1):
@@ -203,9 +221,9 @@ class TokPressEncoder:
         w = BitWriter()
         self._write_header(w, MODE_RANS_ADAPTIVE, n_raw)
         w.write_uint32(n)
-        w.write_uint32(ADAPTIVE_CHUNK_SIZE)
+        w.write_uint32(chunk_size)
         write_symbol_list(w, active_indices)
-        w.write_uint32(enc.state)
+        w.write_uint64(enc.state)
         w.write_uint32(len(words))
         for word in words:
             w.write_uint16(word)
@@ -238,7 +256,7 @@ class TokPressEncoder:
         w.write_uint32(len(escapes))
         for sym in escapes:
             w.write_uint32(sym)
-        w.write_uint32(enc.state)
+        w.write_uint64(enc.state)
         w.write_uint32(len(words))
         for word in words:
             w.write_uint16(word)
