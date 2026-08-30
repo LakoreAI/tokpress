@@ -22,37 +22,25 @@ whole-stream compressors on a per-record basis.
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    A["byte record x"] --> B["1. TOKENIZER<br/>byte-exact BPE: o200k_base or trained vocab"]
+    B -->|"token ids"| C["2. TOKEN-LEVEL LZ77<br/>greedy hash parser, match len l >= 3, flag = vocab size"]
+    C -->|"literals + match tuples"| D["3. ENTROPY (rANS) + BITSTREAM<br/>raw / sparse / split / adaptive / adaptive-split / PPM / dict-cascade"]
+    D -->|"candidate streams"| E["min gate: build all candidates, keep the smallest"]
+    E --> F[".tokz / .tokbi stream"]
+    G["training sample: N schema-homogeneous records"] --> H["offline train<br/>train-vocab → .ranks<br/>train-dict → .tokdict"]
+    H -->|"vocabulary"| B
+    H -->|"priming buffer primes match history"| C
+    H -->|"baked order-0 / order-1 tables"| D
+    G -.->|"compress_many: N records as one adaptive stream"| F
 ```
-[ Input bytes ]
-       │
-       ▼
-┌──────────────────────────────────────────────┐
-│ 1. Tokenizer                                  │
-│    - tiktoken o200k_base, or a vocabulary you │
-│      trained with `train-vocab`               │
-│    - byte-exact _encode_bytes/decode_bytes,   │
-│      round-trips arbitrary (non-UTF-8) bytes  │
-└───────────────────────┬────────────────────────┘
-                        │ token ids
-                        ▼
-┌──────────────────────────────────────────────┐
-│ 2. Token-level LZ77                           │
-│    - optionally primed with a trained TokDict │
-│      (shared cross-record history)            │
-└───────────────────────┬────────────────────────┘
-                        │ literal + match-tuple tokens
-                        ▼
-┌──────────────────────────────────────────────┐
-│ 3. Entropy + bitstream encoder                │
-│    - builds several candidates, keeps the     │
-│      smallest: bit-packed, sparse rANS,       │
-│      split tables, chunked-adaptive,          │
-│      adaptive-split, TokDict cascade          │
-└───────────────────────┬────────────────────────┘
-                        │
-                        ▼
-              [ .tokz binary stream ]
-```
+
+Read it top-to-bottom for encode. The two off-axis arrows carry the project's
+claim: `TokDict`'s priming buffer lets one record match against material learned
+from *other* records, and its baked tables give a pre-trained entropy model instead
+of a per-record one. The dashed edge is the batch mode (`compress_many`), which
+codes all N records as one stream so the adaptive model spans the batch.
 
 Two ways to use it:
 
