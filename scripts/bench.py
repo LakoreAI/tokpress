@@ -7,10 +7,16 @@ many-small-independent-records regime.
 No cherry-picking (AGENT.md): every backend that can run, runs, on every
 corpus; results print as-is, including where TokPress loses.
 
-Corpora are vendored in this repo under `data/bench/` (see
-`data/bench/README.md`); anything missing -- the optional long-text corpora
-in `data/bench/long_text/` -- prints SKIPPED rather than substituting
-synthetic data.
+Corpora are NOT vendored in this repo. They are expected under
+`data/bench/` (gitignored; copy them there yourself) -- or they print
+SKIPPED. Sources:
+- Canterbury Corpus (alice29.txt, fields.c, ...): https://corpus.canterbury.ac.nz/
+- Real JSON/code records (json_heldout.jsonl, small_records.jsonl,
+  real_python_code.py, ...): collected in the sibling `tokenzip` project.
+- Optional long-text corpora (`data/bench/long_text/`): enwik8 prefix from
+  the Large Text Compression Benchmark (https://mattmahoney.net/dc/text.html)
+  and a War and Peace prefix from Project Gutenberg.
+Nothing is substituted with synthetic data.
 """
 
 import bz2
