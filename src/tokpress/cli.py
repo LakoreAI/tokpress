@@ -1,5 +1,6 @@
 """TokPress CLI: compress/decompress/bench/train-dict subcommands."""
 
+import os
 import sys
 import time
 
@@ -11,6 +12,8 @@ BANNER = "TokPress -- pure-Python tiktoken-driven compression"
 HELP_TEXT = """Usage:
   tokpress compress <input_path> [-o <output.tokz>] [--dict <dict.tokdict>]
   tokpress decompress <input.tokz> [-o <output_path>] [--dict <dict.tokdict>]
+  tokpress pack <output.tokz> <record_path> [record_path ...] [--dict <dict.tokdict>]
+  tokpress unpack <input.tokz> <out_dir> [--dict <dict.tokdict>]
   tokpress bench <input_path>
   tokpress train-dict <output.tokdict> <sample_path> [sample_path ...]
 
@@ -18,6 +21,10 @@ Options:
   -o, --output <PATH>     Specify output filepath
   --dict <PATH>           Use a TokDict trained cross-record dictionary
                           (see `train-dict`) for compress/decompress
+
+pack/unpack: batch-compress many independent records as one stream (each
+<record_path> is one record), so the entropy model adapts across records --
+far smaller than per-record compression on many small homogeneous records.
 
 train-dict: each sample file is read as records. UTF-8 newline-delimited
 files (files with two or more newlines, e.g. .jsonl logs) are split per
@@ -176,6 +183,66 @@ def cmd_train_dict(args: list[str]) -> int:
     return 0
 
 
+def cmd_pack(args: list[str]) -> int:
+    if len(args) < 4:
+        print("Error: usage: tokpress pack <output.tokz> <record_path> [record_path ...]")
+        print_help()
+        return 1
+    output_path = args[2]
+    record_paths = args[3:]
+    flags = _parse_flags(args, 3)
+    dictionary = TokDict.load(flags["dict"]) if "dict" in flags else None
+
+    records = []
+    for path in record_paths:
+        with open(path, "rb") as f:
+            records.append(f.read())
+
+    t0 = time.perf_counter()
+    compressed = core.compress_many(records, dictionary=dictionary)
+    elapsed = time.perf_counter() - t0
+
+    with open(output_path, "wb") as f:
+        f.write(compressed)
+
+    original_size = sum(len(r) for r in records)
+    ratio = len(compressed) / original_size if original_size else 0.0
+    print(f"Packed: {output_path} ({len(records)} records)")
+    print(f"  original:   {original_size} bytes")
+    print(f"  compressed: {len(compressed)} bytes")
+    print(f"  ratio:      {ratio:.4f}")
+    print(f"  time:       {elapsed * 1000:.2f} ms")
+    return 0
+
+
+def cmd_unpack(args: list[str]) -> int:
+    if len(args) < 4:
+        print("Error: usage: tokpress unpack <input.tokz> <out_dir>")
+        print_help()
+        return 1
+    input_path = args[2]
+    out_dir = args[3]
+    flags = _parse_flags(args, 3)
+    dictionary = TokDict.load(flags["dict"]) if "dict" in flags else None
+
+    with open(input_path, "rb") as f:
+        compressed = f.read()
+
+    t0 = time.perf_counter()
+    records = core.decompress_many(compressed, dictionary=dictionary)
+    elapsed = time.perf_counter() - t0
+
+    os.makedirs(out_dir, exist_ok=True)
+    width = max(4, len(str(len(records) - 1)))
+    for i, rec in enumerate(records):
+        with open(os.path.join(out_dir, f"{i:0{width}d}.rec"), "wb") as f:
+            f.write(rec)
+
+    print(f"Unpacked: {out_dir} ({len(records)} records)")
+    print(f"  time:     {elapsed * 1000:.2f} ms")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = ["tokpress"] + list(argv) if argv is not None else sys.argv
 
@@ -188,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_compress(args)
     elif cmd in ("decompress", "d"):
         return cmd_decompress(args)
+    elif cmd == "pack":
+        return cmd_pack(args)
+    elif cmd == "unpack":
+        return cmd_unpack(args)
     elif cmd in ("bench", "b"):
         return cmd_bench(args)
     elif cmd == "train-dict":

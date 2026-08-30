@@ -81,3 +81,30 @@ def test_cli_train_dict_single_binary_record_stays_whole(tmp_path):
     res = _run("train-dict", str(dict_file), str(blob))
     assert res.returncode == 0, res.stderr
     assert "samples:         1" in res.stdout
+
+
+def test_cli_pack_unpack_roundtrip(tmp_path):
+    """pack: each file is one record, batch-compressed as one adaptive
+    stream; unpack: writes each record back out separately."""
+    records = [f'{{"user": "u{i}", "action": "click", "ts": {1700000000 + i}}}'.encode() for i in range(30)]
+    rec_paths = []
+    for i, rec in enumerate(records):
+        p = tmp_path / f"rec_{i}.json"
+        p.write_bytes(rec)
+        rec_paths.append(str(p))
+
+    packed = tmp_path / "batch.tokz"
+    res_pack = _run("pack", str(packed), *rec_paths)
+    assert res_pack.returncode == 0, res_pack.stderr
+    assert "30 records" in res_pack.stdout
+    assert os.path.getsize(packed) < sum(len(r) for r in records)
+
+    out_dir = tmp_path / "out"
+    res_unpack = _run("unpack", str(packed), str(out_dir))
+    assert res_unpack.returncode == 0, res_unpack.stderr
+    assert "30 records" in res_unpack.stdout
+
+    restored = sorted(p.name for p in out_dir.iterdir())
+    assert len(restored) == 30
+    for i, rec in enumerate(records):
+        assert (out_dir / f"{i:04d}.rec").read_bytes() == rec
