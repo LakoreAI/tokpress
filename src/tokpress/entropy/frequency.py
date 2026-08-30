@@ -12,13 +12,6 @@ RANS_M_BITS = 16
 RANS_M = 1 << RANS_M_BITS  # 65536
 
 
-def _find_context_index(context_ids: list[int], ctx: int) -> int:
-    for i, c in enumerate(context_ids):
-        if c == ctx:
-            return i
-    return -1
-
-
 class SymbolStats:
     __slots__ = ("freq", "cum_freq", "total_freq", "alphabet_size", "slot_to_symbol")
 
@@ -111,21 +104,3 @@ class SymbolStats:
 
     def find_symbol(self, slot: int) -> int:
         return self.slot_to_symbol[slot]
-
-
-class ContextTableSet:
-    """Order-1 (previous-token-conditioned) rANS tables for one profile,
-    falling back to the order-0 table when no context-specific table was
-    baked for a given previous token.
-    """
-
-    __slots__ = ("_context_ids", "_context_tables", "_default")
-
-    def __init__(self, context_ids: list[int], context_tables: list[SymbolStats], default: SymbolStats) -> None:
-        self._context_ids = context_ids
-        self._context_tables = context_tables
-        self._default = default
-
-    def lookup(self, prev_token: int) -> SymbolStats:
-        idx = _find_context_index(self._context_ids, prev_token)
-        return self._context_tables[idx] if idx != -1 else self._default
