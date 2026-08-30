@@ -1,30 +1,10 @@
-"""Whole-corpus byte-level BPE trainer (VISION.md roadmap item 2 / TODO item
-C): learns a valid, transitively-complete `mergeable_ranks` dict that can be
-loaded straight into a real `tiktoken.Encoding`.
+"""Whole-corpus byte-level BPE trainer: learns a valid, transitively-complete `mergeable_ranks` dict that can be loaded straight into a real `tiktoken.Encoding`.
 
-Why this exists: the project's earlier domain-profile system mined vocab
-pieces by greedy trie longest-match, which is *not* a valid hierarchical BPE
-merge sequence -- a restricted vocabulary is only a valid tokenizer if every
-non-single-byte token is the concatenation of two lower-ranked tokens, and
-mining by longest-match guarantees no such chain. This trainer produces a
-genuine BPE chain: it starts from the 256 single bytes and repeatedly merges
-the most frequent adjacent pair, so every merged token is provably the
-concatenation of two already-defined, lower-rank tokens (verified by
-`validate_mergeable_ranks`).
+A restricted vocabulary is only a valid tokenizer if every non-single-byte token is the concatenation of two lower-ranked tokens (the earlier mined-piece approach violated this). This trainer produces a genuine BPE chain: it starts from the 256 single bytes and repeatedly merges the most frequent adjacent pair, so every merged token is provably the concatenation of two already-defined, lower-rank tokens (verified by `validate_mergeable_ranks`).
 
-Training must match how tiktoken *encodes*: `Encoding._encode_bytes` routes
-valid UTF-8 through `encode_ordinary`, which splits the input on the regex
-`pat_str` and runs BPE per regex piece (only invalid-UTF-8 tails get pure
-whole-input byte BPE). A vocabulary trained with naive whole-input BPE
-therefore fragments on piece boundaries and under-performs. So this trainer
-pre-tokenizes the corpus with the same `pat_str` and forbids merges across
-piece boundaries -- the standard GPT-style pipeline -- making the trained
-vocab's encoding exactly reproducible by tiktoken.
+Training must match how tiktoken encodes: `Encoding._encode_bytes` routes valid UTF-8 through `encode_ordinary`, which splits the input on the regex `pat_str` and runs BPE per regex piece (only invalid-UTF-8 tails get pure whole-input byte BPE). A vocabulary trained with naive whole-input BPE therefore fragments on piece boundaries and under-performs, so this trainer pre-tokenizes the corpus with the same `pat_str` and forbids merges across piece boundaries -- the standard GPT-style pipeline -- making the trained vocab's encoding exactly reproducible by tiktoken.
 
-Correctness-first, deliberately not a scale-optimized trainer: the standard
-byte-level BPE loop is O(num_merges * corpus_size) in the pure-Python list
-rebuild, so training is meant for a *sampled* corpus (default cap 256KB) --
-an offline, one-time cost. See docs/TODO.md item C.
+Correctness-first, deliberately not a scale-optimized trainer: the byte-level BPE loop is O(num_merges * corpus_size) in the pure-Python list rebuild, so training is meant for a sampled corpus (default cap 256KB), an offline one-time cost.
 """
 
 import re
@@ -127,15 +107,9 @@ def _train_pieces(
 
 
 def train_mergeable_ranks(corpus: bytes, vocab_size: int, progress=None) -> dict[bytes, int]:
-    """Learn a byte-level BPE vocabulary from `corpus` (raw bytes, already
-    sampled/capped by the caller if desired). If the corpus is valid UTF-8,
-    it is pre-tokenized with DEFAULT_PAT_STR and merges never cross piece
-    boundaries (matching how tiktoken's `_encode_bytes` actually encodes);
-    otherwise whole-input byte BPE is used. Returns mergeable_ranks: bytes ->
-    rank, rank 0..255 = the single bytes, then one rank per merge.
+    """Learn a byte-level BPE vocabulary from `corpus` (raw bytes, already sampled/capped by the caller if desired). If the corpus is valid UTF-8, it is pre-tokenized with DEFAULT_PAT_STR and merges never cross piece boundaries (matching how tiktoken's `_encode_bytes` actually encodes); otherwise whole-input byte BPE is used. Returns mergeable_ranks: bytes -> rank, rank 0..255 = the single bytes, then one rank per merge.
 
-    Deterministic for a given corpus: the most frequent pair is picked with a
-    fixed tie-break (highest count, then lowest pair key).
+    Deterministic for a given corpus: the most frequent pair is picked with a fixed tie-break (highest count, then lowest pair key).
     """
     ranks, _seq = _train(corpus, vocab_size, progress)
     return ranks
@@ -144,9 +118,7 @@ def train_mergeable_ranks(corpus: bytes, vocab_size: int, progress=None) -> dict
 def train_with_merge_sequence(
     corpus: bytes, vocab_size: int, progress=None
 ) -> tuple[dict[bytes, int], list[tuple[bytes, bytes]]]:
-    """Like train_mergeable_ranks, but also returns the exact (left, right)
-    byte-piece merge sequence, for verifying tiktoken's encoder reproduces
-    the trained chain exactly (see verify_encoding_agreement)."""
+    """Like train_mergeable_ranks, but also returns the exact (left, right) byte-piece merge sequence, for verifying tiktoken's encoder reproduces the trained chain exactly."""
     return _train(corpus, vocab_size, progress)
 
 
@@ -157,10 +129,7 @@ def _train(corpus: bytes, vocab_size: int, progress=None) -> tuple[dict[bytes, i
 
 
 def encode_with_merge_sequence(corpus: bytes, merge_sequence: list[tuple[bytes, bytes]]) -> list[int]:
-    """Re-apply a trained merge sequence to a corpus (with the same
-    pre-tokenization/boundaries the trainer used), producing the token-id
-    list the trained chain implies. Used to verify tiktoken.Encoding's
-    byte-level encoder agrees with the trained merge order exactly."""
+    """Re-apply a trained merge sequence to a corpus (with the same pre-tokenization/boundaries the trainer used), producing the token-id list the trained chain implies. Used to verify tiktoken's encoder agrees with the trained merge order exactly."""
     ids, boundaries = _build_ids_and_boundaries(_pretokenize_bytes(corpus))
     ids_to_bytes = {i: bytes([i]) for i in range(256)}
     next_id = 256
@@ -174,10 +143,7 @@ def encode_with_merge_sequence(corpus: bytes, merge_sequence: list[tuple[bytes, 
 
 
 def validate_mergeable_ranks(mergeable_ranks: dict[bytes, int]) -> bool:
-    """Verify the merge chain is valid: every single byte 0..255 present, and
-    every multi-byte token is the concatenation of two tokens with strictly
-    lower ranks. A real tiktoken.Encoding relies on this invariant.
-    """
+    """Verify the merge chain is valid: every single byte 0..255 present, and every multi-byte token is the concatenation of two tokens with strictly lower ranks. A real tiktoken.Encoding relies on this invariant."""
     for b in range(256):
         if mergeable_ranks.get(bytes([b])) != b:
             return False
@@ -199,9 +165,7 @@ def validate_mergeable_ranks(mergeable_ranks: dict[bytes, int]) -> bool:
 
 
 def sample_corpus(blob: bytes, max_bytes: int) -> bytes:
-    """Cap a training corpus: head-sampling is fine for vocab training (the
-    distribution of a schema's byte n-grams is stable across the stream), and
-    keeps the O(merges * n) trainer tractable. Deterministic."""
+    """Cap a training corpus: head-sampling is fine for vocab training (the distribution of a schema's byte n-grams is stable across the stream) and keeps the O(merges * n) trainer tractable. Deterministic."""
     if len(blob) <= max_bytes:
         return blob
     return blob[:max_bytes]
@@ -230,11 +194,7 @@ def load_rank_file(path: str) -> dict[bytes, int]:
 
 
 def build_tiktoken_encoding(mergeable_ranks: dict[bytes, int], name: str = "tokpress-custom") -> object:
-    """Construct a real tiktoken.Encoding from trained ranks. Byte-exact
-    tokenization (`_encode_bytes`/`decode_bytes`) works for arbitrary binary,
-    exactly like o200k_base's adapter path. The pat_str is the SAME one used
-    for training pre-tokenization, so tiktoken's str-level `encode` and the
-    trained chain agree."""
+    """Construct a real tiktoken.Encoding from trained ranks. Byte-exact tokenization (`_encode_bytes`/`decode_bytes`) works for arbitrary binary, exactly like o200k_base's adapter path. The pat_str is the same one used for training pre-tokenization, so tiktoken's str-level `encode` and the trained chain agree."""
     import tiktoken
 
     return tiktoken.Encoding(

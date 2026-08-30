@@ -1,29 +1,10 @@
-"""TokPressEncoder: wire-format encoder. Tokenizes with tiktoken's o200k_base
-encoding (see tokenizer/tiktoken_adapter.py), applies token-level LZ77 primed
-with no shared dictionary, then picks the smallest of several entropy/
-bitstream candidates.
+"""TokPressEncoder: wire-format encoder. Tokenizes with tiktoken's o200k_base encoding (or a custom trained vocabulary via tokenizer/tiktoken_adapter.py), applies token-level LZ77 primed with an optional TokDict, then keeps the smallest of several entropy/bitstream candidates.
 
-Container: magic "TOKZ" (4B) + version(1B)=1 + mode(1B) + uncompressed_size(u32 LE),
-then mode-specific payload.
+Container: magic "TOKZ" (4B) + version(1B)=1 + mode(1B) + uncompressed_size(u32 LE), then a mode-specific payload.
 
-Modes: MODE_RAW_TOKENS=0 (fixed-width bit-packed tokens), MODE_RANS_SPARSE=1
-(per-record freq table + rANS), MODE_RAW_FALLBACK=2 (empty input only),
-MODE_RANS_DICT=3 (rANS against a pre-trained, out-of-band TokDict -- see
-dictionary.py -- carries only an 8-byte fingerprint instead of a per-record
-freq table), MODE_RANS_ADAPTIVE=4 (chunked, cumulative-history rANS -- see
-_encode_rans_adaptive below).
+Modes: MODE_RAW_TOKENS=0 (fixed-width bit-packed tokens), MODE_RANS_SPARSE=1 (per-record freq table + rANS), MODE_RAW_FALLBACK=2 (empty input only), MODE_RANS_DICT=3 (rANS against a pre-trained, out-of-band TokDict -- carries only an 8-byte fingerprint instead of a per-record freq table), MODE_RANS_ADAPTIVE=4 (chunked, cumulative-history rANS), MODE_RANS_SPLIT=5 (match metadata in its own tables), MODE_RANS_ADAPTIVE_SPLIT=6 (both split and adaptive).
 
-The raw-tokens candidate is always built; the rANS-adaptive candidate is
-only built (and only wins if smaller) when the record's distinct-symbol
-count fits within RANS_M (table-log 16, RANS_M=65536) -- every active
-symbol needs frequency >= 1, so a record with more distinct symbols than
-that can never be rebalanced to sum to RANS_M (see entropy/frequency.py's
-count_symbols). rANS-sparse has no such limit (see its own docstring).
-The rANS-dict candidate is only built when a TokDict was supplied. Both
-sparse-table modes transmit the active-symbol-id list as sorted delta +
-varint (see bitstream/varint.py) rather than fixed 4-byte ids, since
-o200k_base's ~200k-token alphabet makes the naive encoding dominate a
-per-record table for any text with more than a few hundred distinct tokens.
+The raw-tokens candidate is always built; the rANS-adaptive candidate is only built when the record's distinct-symbol count fits within RANS_M (every active symbol needs frequency >= 1, so a record with more distinct symbols can never be rebalanced to sum to RANS_M; see entropy/frequency.py's count_symbols); the rANS-dict candidate only when a TokDict was supplied. All applicable candidates are built and the smallest is kept. Sparse-table modes transmit the active-symbol-id list as sorted delta + varint (see bitstream/varint.py), since o200k_base's ~200k-token alphabet makes a naive fixed-width encoding dominate a per-record table for any text with more than a few hundred distinct tokens.
 """
 
 from ..bitstream import BitWriter, write_symbol_list
@@ -119,19 +100,7 @@ class TokPressEncoder:
         return w.getvalue()
 
     def _encode_rans_sparse(self, lz_tokens: list[int], n_raw: int) -> bytes:
-        """Order-0 rANS with an escape symbol for the long tail: a single
-        table can only hold RANS_M distinct symbols (see
-        entropy/frequency.py's count_symbols), and long/lexically diverse
-        text can still exceed even RANS_M=65536 (e.g. a large document with
-        a very rich vocabulary). Rather than gate this mode out entirely
-        (which used to silently fall back to no entropy coding at all --
-        MODE_RAW_TOKENS' flat bit-packing -- for any record over the line,
-        including ordinary prose at the old RANS_M=4096), keep only the
-        RANS_M-1 most frequent symbols in the table and route everything
-        else through a reserved escape symbol, exactly like dictionary.py's
-        TokDict. Always structurally valid; whether it wins is decided
-        purely by final size.
-        """
+        """Order-0 rANS with an escape symbol for the long tail. A single table can only hold RANS_M distinct symbols (see entropy/frequency.py's count_symbols), and long, lexically diverse text can still exceed even RANS_M=65536. Rather than gating this mode out entirely (which would silently fall back to flat bit-packing for any record over the line), keep only the RANS_M-1 most frequent symbols in the table and route everything else through a reserved escape symbol, exactly like dictionary.py's TokDict. Always structurally valid; whether it wins is decided purely by final size."""
         real_alphabet_size = self.tokenizer.match_flag + 1
         escape_symbol = real_alphabet_size
         alphabet_size = real_alphabet_size + 1
@@ -189,24 +158,7 @@ class TokPressEncoder:
         return w.getvalue()
 
     def _encode_rans_split(self, lz_tokens: list[int], n_raw: int) -> bytes:
-        """Order-0 rANS with LZ match-metadata split into its own tables
-        instead of sharing one table with literal tokens. A match tuple's
-        distance/length bytes are near-uniform over [0, 255], a completely
-        different distribution from literal tokens' Zipfian one, and
-        low-value distance/length bytes numerically collide with low-id
-        literal tokens in a shared table, diluting both distributions.
-        Measured directly (real corpora): a role bit (literal-vs-match) plus
-        three small [0,255] tables for distance-high, distance-low, and
-        length bytes, versus one shared literal+metadata table, saves
-        6-16% of the entropy-coded payload. This was previously measured to
-        *hurt* (see docs/research.tex) at the old RANS_M=4096 -- splitting a
-        4096-slot budget across more tables cost the far more frequent
-        literals more than it helped rare match metadata -- but no longer
-        applies now that every table gets its own full RANS_M=65536 budget.
-        The literal table still needs escape-capping (same as
-        _encode_rans_sparse); the three metadata tables and the role-bit
-        table never do, since [0,255] and {0,1} always fit within RANS_M.
-        """
+        """Order-0 rANS with LZ match-metadata split into its own tables instead of sharing one table with literal tokens. A match tuple's distance/length bytes are near-uniform over [0, 255], a completely different distribution from literal tokens' Zipfian one, and low-value distance/length bytes numerically collide with low-id literal tokens in a shared table, diluting both distributions. Measured directly: a role bit (literal-vs-match) plus three small [0,255] tables for distance-high, distance-low, and length bytes, versus one shared literal+metadata table, saves 6-16% of the entropy-coded payload. This previously hurt at the old RANS_M=4096 (splitting a 4096-slot budget across more tables cost the far more frequent literals more than it helped rare match metadata), but no longer applies now that every table gets its own full RANS_M=65536 budget. The literal table still needs escape-capping (same as _encode_rans_sparse); the three metadata tables and the role-bit table never do, since [0,255] and {0,1} always fit within RANS_M."""
         match_flag = self.tokenizer.match_flag
         real_alphabet_size = match_flag + 1
         escape_symbol = real_alphabet_size
@@ -311,16 +263,7 @@ class TokPressEncoder:
             w.write_bits(stats.freq[sym_id] - 1, RANS_M_BITS)  # freq-1: see _encode_rans_sparse
 
     def _encode_rans_adaptive_split(self, lz_tokens: list[int], n_raw: int) -> bytes:
-        """Combines _encode_rans_split's match-metadata separation with
-        _encode_rans_adaptive's zero-transmission-cost chunked history,
-        applied to the literal sub-stream specifically (role/distance/length
-        stay static small tables -- their alphabets are always tiny, so
-        there is little left to gain from adaptivity there). Measured
-        independently: match-metadata separation alone helps records where
-        chunked-adaptive doesn't win, and vice versa -- this mode lets both
-        wins stack for records where they would otherwise trade off against
-        each other via the min(candidates, key=len) selection.
-        """
+        """Combines _encode_rans_split's match-metadata separation with _encode_rans_adaptive's zero-transmission-cost chunked history, applied to the literal sub-stream specifically (role/distance/length stay static small tables, since their alphabets are always tiny and there is little to gain from adaptivity there). Measured independently, match-metadata separation alone helps records where chunked-adaptive does not win, and vice versa; this mode lets both wins stack for records where they would otherwise trade off against each other via the min(candidates, key=len) selection."""
         match_flag = self.tokenizer.match_flag
         n = len(lz_tokens)
 
@@ -438,16 +381,7 @@ class TokPressEncoder:
         return w.getvalue()
 
     def _encode_rans_adaptive(self, lz_tokens: list[int], n_raw: int) -> bytes:
-        """Chunked, cumulative-history rANS: the record's active-symbol-id
-        list is transmitted once (no per-symbol frequency), and each chunk
-        after the first is coded against a table built purely from a
-        Laplace-smoothed count of every *earlier* chunk's symbols -- the
-        decoder derives the identical table from what it has already
-        decoded, so no per-chunk table bytes are ever transmitted. Chunk c's
-        table must depend only on chunks 0..c-1, which is why we snapshot
-        every chunk's table in a forward pass before encoding (rANS itself
-        must encode in reverse -- see entropy/rans.py's module docstring).
-        """
+        """Chunked, cumulative-history rANS: the record's active-symbol-id list is transmitted once (no per-symbol frequency), and each chunk after the first is coded against a table built purely from a Laplace-smoothed count of every earlier chunk's symbols. The decoder derives the identical table from what it has already decoded, so no per-chunk table bytes are ever transmitted. Chunk c's table must depend only on chunks 0..c-1, which is why every chunk's table is snapshotted in a forward pass before encoding (rANS itself must encode in reverse)."""
         active_indices = sorted(set(lz_tokens))
         local_index = {sym: i for i, sym in enumerate(active_indices)}
         k = len(active_indices)
@@ -488,16 +422,7 @@ class TokPressEncoder:
         return w.getvalue()
 
     def _encode_rans_dict(self, lz_tokens: list[int], n_raw: int) -> bytes:
-        """rANS against a pre-trained TokDict, with an order-1 -> order-0 ->
-        explicit-escape cascade: if the previous symbol is one of the
-        dictionary's trained contexts, try that context's table first; an
-        escape from it falls through to the order-0 table; an escape from
-        THAT carries the real symbol out-of-band. Which table to try for a
-        position depends only on the previous symbol and the dictionary's
-        fixed metadata, never on the current symbol, so this is fully
-        derivable by the decoder without anything extra being transmitted
-        for the table choice itself -- see dictionary.py's module docstring.
-        """
+        """rANS against a pre-trained TokDict, with an order-1 -> order-0 -> explicit-escape cascade: if the previous symbol is one of the dictionary's trained contexts, try that context's table first; an escape from it falls through to the order-0 table; an escape from that carries the real symbol out-of-band. Which table to try for a position depends only on the previous symbol and the dictionary's fixed metadata, never on the current symbol, so the decoder can derive the same cascade without anything extra being transmitted for the table choice itself."""
         order0_stats = self.dictionary.stats
         context_stats = self.dictionary.context_stats
         escape_symbol = self.dictionary.escape_symbol

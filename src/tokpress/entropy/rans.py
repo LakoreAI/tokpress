@@ -1,18 +1,6 @@
-"""A 16-bit-word-oriented rANS encoder/decoder, table-log 16 (RANS_M=65536), byte-renorm bound RANS_L=RANS_M<<4.
+"""A 16-bit-word-oriented rANS encoder/decoder at table-log 16 (RANS_M=65536), with byte-renorm bound RANS_L=RANS_M<<4 and a 64-bit state mask.
 
-State is masked to 64 bits after every update. This project is pure Python
-(arbitrary-precision ints), so unlike a hardware/C port there is no register
-width forcing a 32-bit state -- the mask exists to make the intended fixed-
-width wraparound behavior explicit and self-documenting, not because Python
-needs it. The headroom is verified, not assumed: with RANS_M_BITS=16 and
-RANS_L=RANS_M<<4 (preserving the same RANS_L/RANS_M=16 ratio this design
-originally shipped with at RANS_M_BITS=12), the worst-case post-renorm state
-is bounded by max_x = (RANS_L>>RANS_M_BITS)<<16 * (RANS_M-1) < 2**36, and the
-worst-case post-update state (q<<RANS_M_BITS + r + c) stays in that same
-neighborhood -- comfortably inside 64 bits with a wide margin, unlike a naive
-RANS_M_BITS bump at a *fixed* 32-bit mask, which this project tried on paper
-first and found silently overflows 32 bits in edge cases (max freq/cum_freq
-combinations) before writing any code for it.
+The state is masked to 64 bits after every update. Pure Python has no register-width constraint forcing 32 bits, so the mask exists to make the intended fixed-width wraparound explicit. The headroom is verified, not assumed: with RANS_L=RANS_M<<4 the worst-case post-renorm state is bounded by (RANS_L>>RANS_M_BITS)<<16 * (RANS_M-1) < 2**36, and the worst-case post-update state (q<<RANS_M_BITS + r + c) stays in the same neighborhood -- comfortably inside 64 bits.
 """
 
 from .frequency import RANS_M, RANS_M_BITS, SymbolStats

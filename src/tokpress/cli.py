@@ -1,4 +1,4 @@
-"""TokPress CLI: compress/decompress/pack/unpack/bench/train-dict/train-vocab subcommands."""
+"""TokPress CLI: compress/decompress/pack/unpack/read/bench/tokenize-stats/train-dict/train-vocab/fit subcommands."""
 
 import os
 import sys
@@ -202,14 +202,7 @@ def cmd_bench(args: list[str]) -> int:
 
 
 def _load_sample_records(path: str) -> list[bytes]:
-    """Read one train-dict sample path as a list of records.
-
-    Newline-delimited text files (valid UTF-8 with two or more newlines --
-    e.g. .jsonl logs) are split per line into individual records, since that
-    is the project's core many-small-records regime; anything else (binary
-    data, a single-line record) is kept whole. A file of N records must
-    train the dictionary on N independent records, not on one giant blob.
-    """
+    """Read one train-dict sample path as a list of records. UTF-8 newline-delimited text files (two or more newlines, e.g. .jsonl logs) are split per line into individual records, since that is the core many-small-records regime; anything else (binary data, a single-line record) is kept whole. A file of N records must train the dictionary on N independent records, not on one giant blob."""
     with open(path, "rb") as f:
         data = f.read()
     try:
@@ -315,9 +308,7 @@ def cmd_unpack(args: list[str]) -> int:
 
 
 def cmd_fit(args: list[str]) -> int:
-    """train-vocab + train-dict in one step: writes <out_prefix>.ranks and
-    <out_prefix>.tokdict, with the dictionary trained on the custom
-    vocabulary (not o200k_base)."""
+    """train-vocab + train-dict in one step: writes <out_prefix>.ranks and <out_prefix>.tokdict, with the dictionary trained on the custom vocabulary (not o200k_base)."""
     if len(args) < 4:
         print("Error: usage: tokpress fit <out_prefix> <corpus_path> [corpus_path ...]")
         print_help()

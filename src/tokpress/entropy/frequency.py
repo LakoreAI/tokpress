@@ -1,12 +1,6 @@
-"""SymbolStats: frequency-table normalization (scaling raw counts to RANS_M total, with a round-robin rounding-drift fixup) plus the decode lookup table. Encoder and decoder must derive bit-identical tables from the same symbol counts -- rANS is not fault-tolerant to a divergent table.
+"""SymbolStats: frequency-table normalization (scaling raw counts to sum to RANS_M, with a round-robin rounding-drift fixup) plus the decode lookup table. Encoder and decoder must derive bit-identical tables from the same symbol counts, since rANS is not fault-tolerant to a divergent table.
 
-RANS_M_BITS/RANS_M are defined here (not in entropy/rans.py) because rans.py
-already imports SymbolStats from this module -- this is the one direction
-that avoids a circular import, and it makes this module the single source of
-truth for the table-log (rans.py derives RANS_L from RANS_M rather than
-maintaining its own independent copy, which used to silently risk drifting
-out of sync -- both entropy/rans.py's *and* this module's RANS_M happened to
-be hardcoded to the same 4096 value in two separate places)."""
+RANS_M_BITS/RANS_M are defined here, not in entropy/rans.py, to avoid a circular import (rans.py imports SymbolStats from this module) and to make this module the single source of truth for the table-log; rans.py derives RANS_L from RANS_M instead of keeping its own copy."""
 
 RANS_M_BITS = 16
 RANS_M = 1 << RANS_M_BITS  # 65536
@@ -33,12 +27,7 @@ class SymbolStats:
         self.normalize(raw_counts, total_symbols, build_decode_lut)
 
     def normalize(self, raw_counts: list[int], total_symbols: int, build_decode_lut: bool = True) -> None:
-        """Scale a raw per-symbol count array (len == alphabet_size) to sum to
-        RANS_M. Shared by count_symbols (per-record, counts derived from a
-        symbol list) and TokDict.train (dictionary-wide, counts accumulated
-        across many training records) -- both must go through this one place
-        so the RANS_M-feasibility invariant below is enforced everywhere.
-        """
+        """Scale a raw per-symbol count array (len == alphabet_size) to sum to RANS_M. Shared by count_symbols (per-record) and TokDict.train (dictionary-wide) so the RANS_M-feasibility invariant is enforced in one place."""
         if total_symbols == 0:
             return
 

@@ -1,6 +1,4 @@
-"""Token-level LZ77 with dictionary priming (zstd/FemtoZip-style shared
-cross-record match history).
-"""
+"""Token-level LZ77 with dictionary priming: a shared cross-record match history (zstd/FemtoZip-style) lets a record match against material learned from other records."""
 
 DEFAULT_MATCH_FLAG = 0x0FFF  # 4095, a symbol above normal vocab range
 MATCH_WINDOW = 32768  # keeps distances < 2**16 (2-byte distance field)

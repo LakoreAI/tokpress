@@ -1,4 +1,4 @@
-"""Byte-oriented LEB128-style varint helpers, plus a sorted-symbol-id-list codec (delta + varint) shared by every wire mode that needs to transmit a sparse set of alphabet indices without spending a fixed 4 bytes/symbol -- o200k_base's ~200k-token alphabet makes that fixed cost dominate a per-record table for any text with a few thousand distinct tokens."""
+"""Byte-oriented LEB128-style varint helpers, plus a sorted-symbol-id-list codec (delta + varint) shared by every wire mode that needs to transmit a sparse set of alphabet indices. o200k_base's ~200k-token alphabet makes a fixed 4 bytes/symbol dominate a per-record table for any text with a few thousand distinct tokens."""
 
 from .bit_reader import BitReader
 from .bit_writer import BitWriter

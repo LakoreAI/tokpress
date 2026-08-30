@@ -1,45 +1,12 @@
 """TokDict: a trained, shared cross-record dictionary.
 
-This is the mechanism behind docs/VISION.md's actual differentiation claim
-for the many-small-homogeneous-records regime (MongoDB per-collection zstd
-dictionaries, log/observability ingestion, IETF SCHC): train once on a
-sample of representative records, then every future record of the same
-shape gets to (a) LZ-match against a shared cross-record token history
-instead of starting from nothing, (b) skip transmitting its own per-record
-frequency table entirely by reusing a baked, shared order-0 rANS table, and
-(c) where the training data supports it, use an order-1 (previous-token-
-conditioned) baked table for the most common contexts, falling back to
-order-0 otherwise.
+TokDict adapts the codec to a domain by training once on a sample of representative records, so every future record of the same shape can (a) LZ-match against a shared cross-record token history instead of starting from nothing, (b) skip transmitting its own per-record frequency table by reusing a baked, shared order-0 rANS table, and (c) where the training data supports it, use an order-1 (previous-token-conditioned) baked table for the most common contexts, falling back to order-0 otherwise.
 
-Order-1 here is safe against the "context dilution" trap documented in
-docs/STATUS.md: that finding was about a *per-record*, no-shared-training-
-data static table, where every (context, symbol) pair not seen in this one
-record has to be transmitted or escaped at real cost. A dictionary trained
-once over many representative records amortizes that cost the same way the
-order-0 table already does -- only the DICTIONARY's training cost is paid,
-never a per-record cost -- so a context worth its own table (enough
-transitions observed) is a straightforward win, and a context without
-enough support just never gets one (falls through to order-0, at no loss).
+Order-1 is safe here against the "context dilution" trap: a per-record static table has to transmit or escape every (context, symbol) pair not seen in that single record, but a dictionary trained once over many records amortizes that cost exactly like the order-0 table does -- only the dictionary's training cost is paid, never a per-record cost. A context worth its own table (enough observed transitions) is a straightforward win; a context without enough support just never gets one and falls through to order-0 at no loss.
 
-Real records almost always contain at least one literal (an id, a
-timestamp, a free-text value) that never appeared in training, so every
-baked table -- order-0 and every context table -- reserves one extra
-symbol -- `escape_symbol`, always `stats.alphabet_size - 1`, shared across
-all of them -- with a small trained probability mass. Decoding an escape
-from a context table means "fall through to the order-0 table for this
-symbol"; decoding an escape from the order-0 table means "this symbol's
-real value is carried out-of-band as an explicit uint32" (see
-codec/encoder.py's _encode_rans_dict / codec/decoder.py's MODE_RANS_DICT
-branch). This two-level cascade is fully causal: which table to *try* for
-a given position depends only on the previous (already-decoded) symbol and
-the dictionary's fixed, pre-trained metadata, never on the current
-symbol's value, so the decoder never needs anything transmitted to make
-the same choice the encoder made.
+Real records almost always contain at least one literal (an id, a timestamp, a free-text value) that never appeared in training, so every baked table -- order-0 and every context table -- reserves one extra symbol, `escape_symbol` (always `stats.alphabet_size - 1`, shared across all of them), with a small trained probability mass. Decoding an escape from a context table means "fall through to the order-0 table for this symbol"; decoding an escape from the order-0 table means "this symbol's real value is carried out-of-band as an explicit uint32" (see codec/encoder.py's _encode_rans_dict and codec/decoder.py's MODE_RANS_DICT branch). This two-level cascade is fully causal: which table to try for a given position depends only on the previous (already-decoded) symbol and the dictionary's fixed, pre-trained metadata, never on the current symbol's value, so the decoder never needs anything transmitted to make the same choice the encoder made.
 
-Nothing here depends on a custom-trained tokenizer vocabulary -- it trains
-directly on top of whichever tokenizer/match_flag TiktokenTokenizer already
-provides (o200k_base), so it does not wait on the (deferred) whole-corpus
-BPE trainer in docs/TODO.md item 2.
+Nothing here depends on a custom-trained tokenizer vocabulary; it trains directly on top of whichever tokenizer TiktokenTokenizer provides.
 """
 
 import hashlib
@@ -60,19 +27,15 @@ _ORDER0_ESCAPE_SHARE = 0.015
 
 # Context tables are trained on far fewer observations per context than the
 # order-0 table sees overall, so "this specific transition wasn't in
-# training" is a common event for them, not a rare one -- measured directly
-# (scripts/bench.py's trained-dictionary regime, both at 35 and 184 training
-# records): 0.015 (the order-0 share) actively made order-1 conditioning
-# *worse* than order-0-only, while 0.3-0.4 gave the 6-8% improvement
-# comparable to docs/research.tex's predecessor system (which reported
-# 5-9%). Do not reuse _ORDER0_ESCAPE_SHARE here without re-measuring.
+# training" is a common event for them, not a rare one. Measured directly:
+# 0.015 (the order-0 share) actively made order-1 conditioning worse than
+# order-0-only, while 0.3-0.4 gave a 6-8% improvement. Do not reuse
+# _ORDER0_ESCAPE_SHARE here without re-measuring.
 _CONTEXT_ESCAPE_SHARE = 0.35
 
 # Order-1 context tables: only build one for a (previous-token) context that
 # was actually observed often enough in training to predict confidently, and
 # cap how many we keep (each one costs space in the saved .tokdict file).
-# Mirrors a design measured to work well in docs/research.tex's predecessor
-# system (top 64 contexts, >=20 transitions).
 MAX_CONTEXT_TABLES = 64
 MIN_CONTEXT_TRANSITIONS = 20
 
@@ -169,13 +132,7 @@ class TokDict:
         total: int,
         escape_share: float,
     ) -> SymbolStats:
-        """Cap a raw per-symbol count array to RANS_M-1 real symbols plus a
-        reserved escape slot, then normalize. Shared by the order-0 table
-        and every order-1 context table -- same escape-capping pattern as
-        codec/encoder.py's _encode_rans_sparse. escape_share differs sharply
-        between the two callers -- see _ORDER0_ESCAPE_SHARE/
-        _CONTEXT_ESCAPE_SHARE's comments.
-        """
+        """Cap a raw per-symbol count array to RANS_M-1 real symbols plus a reserved escape slot, then normalize. Shared by the order-0 table and every order-1 context table (same escape-capping pattern as codec/encoder.py's _encode_rans_sparse). escape_share differs sharply between the two callers -- see _ORDER0_ESCAPE_SHARE/_CONTEXT_ESCAPE_SHARE's comments."""
         raw_counts = list(raw_counts)
         escape_count = max(1, round(total * escape_share))
         raw_counts[escape_symbol] += escape_count
