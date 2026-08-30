@@ -2,13 +2,13 @@
 
 Container: magic "TOKZ" (4B) + version(1B)=1 + mode(1B) + uncompressed_size(u32 LE), then a mode-specific payload.
 
-Modes: MODE_RAW_TOKENS=0 (fixed-width bit-packed tokens), MODE_RANS_SPARSE=1 (per-record freq table + rANS), MODE_RAW_FALLBACK=2 (empty input only), MODE_RANS_DICT=3 (rANS against a pre-trained, out-of-band TokDict -- carries only an 8-byte fingerprint instead of a per-record freq table), MODE_RANS_ADAPTIVE=4 (chunked, cumulative-history rANS), MODE_RANS_SPLIT=5 (match metadata in its own tables), MODE_RANS_ADAPTIVE_SPLIT=6 (both split and adaptive).
+Modes: MODE_RAW_TOKENS=0 (fixed-width bit-packed tokens), MODE_RANS_SPARSE=1 (per-record freq table + rANS), MODE_RAW_FALLBACK=2 (empty input only), MODE_RANS_DICT=3 (rANS against a pre-trained, out-of-band TokDict -- carries only an 8-byte fingerprint instead of a per-record freq table), MODE_RANS_ADAPTIVE=4 (chunked, cumulative-history rANS), MODE_RANS_SPLIT=5 (match metadata in its own tables), MODE_RANS_ADAPTIVE_SPLIT=6 (both split and adaptive), MODE_RANS_PPM=7 (per-record PPM-style order-1 with escape-to-order-0), MODE_RANS_PPM_SPLIT=8 (the same order-1 cascade applied to the literal sub-stream, with match metadata in its own tables).
 
 The raw-tokens candidate is always built; the rANS-adaptive candidate is only built when the record's distinct-symbol count fits within RANS_M (every active symbol needs frequency >= 1, so a record with more distinct symbols can never be rebalanced to sum to RANS_M; see entropy/frequency.py's count_symbols); the rANS-dict candidate only when a TokDict was supplied. All applicable candidates are built and the smallest is kept. Sparse-table modes transmit the active-symbol-id list as sorted delta + varint (see bitstream/varint.py), since o200k_base's ~200k-token alphabet makes a naive fixed-width encoding dominate a per-record table for any text with more than a few hundred distinct tokens.
 """
 
 from ..bitstream import BitWriter, write_symbol_list
-from ..dictionary import TokDict
+from ..dictionary import MIN_CONTEXT_TRANSITIONS, TokDict
 from ..entropy.frequency import SymbolStats
 from ..entropy.rans import RANS_M, RANS_M_BITS, RansEncoder
 from ..tokenizer.tiktoken_adapter import TiktokenTokenizer
@@ -23,6 +23,8 @@ MODE_RANS_DICT = 3
 MODE_RANS_ADAPTIVE = 4
 MODE_RANS_SPLIT = 5
 MODE_RANS_ADAPTIVE_SPLIT = 6
+MODE_RANS_PPM = 7
+MODE_RANS_PPM_SPLIT = 8
 
 # Chunk size for MODE_RANS_ADAPTIVE: each chunk after the first is entropy-coded
 # against a table built purely from already-processed chunks (Laplace-smoothed),
@@ -82,6 +84,9 @@ class TokPressEncoder:
         if len(set(lz_tokens)) <= RANS_M and len(lz_tokens) >= ADAPTIVE_MIN_SYMBOLS:
             candidates.append(self._encode_rans_adaptive(lz_tokens, n_raw))
         candidates.append(self._encode_rans_adaptive_split(lz_tokens, n_raw))
+        if len(set(lz_tokens)) < RANS_M and len(lz_tokens) >= ADAPTIVE_MIN_SYMBOLS:
+            candidates.append(self._encode_rans_ppm(lz_tokens, n_raw))
+            candidates.append(self._encode_rans_ppm_split(lz_tokens, n_raw))
 
         if self.dictionary is not None:
             dict_lz_tokens = self._lz.encode(tokens, self.dictionary.priming_tokens)
@@ -119,7 +124,7 @@ class TokPressEncoder:
 
         stats = SymbolStats(alphabet_size)
         stats.normalize(raw_counts, total, build_decode_lut=False)
-        active_indices = sorted(i for i in range(alphabet_size) if stats.freq[i] > 0)
+        active_indices = sorted(stats.active)
 
         escapes: list[int] = []
         if stats.freq[escape_symbol] > 0:
@@ -209,7 +214,7 @@ class TokPressEncoder:
         literal_stats = SymbolStats(literal_alphabet_size)
         if total > 0:
             literal_stats.normalize(raw_counts, total, build_decode_lut=False)
-        literal_active = sorted(idx for idx in range(literal_alphabet_size) if literal_stats.freq[idx] > 0)
+        literal_active = sorted(literal_stats.active)
 
         # rANS encodes in reverse logical order (see entropy/rans.py); within
         # one position's group of events, the encode calls must be issued in
@@ -257,7 +262,7 @@ class TokPressEncoder:
         return w.getvalue()
 
     def _write_small_table(self, w: BitWriter, stats: SymbolStats) -> None:
-        active = sorted(i for i in range(stats.alphabet_size) if stats.freq[i] > 0)
+        active = sorted(stats.active)
         write_symbol_list(w, active)
         for sym_id in active:
             w.write_bits(stats.freq[sym_id] - 1, RANS_M_BITS)  # freq-1: see _encode_rans_sparse
@@ -414,6 +419,230 @@ class TokPressEncoder:
         w.write_uint32(n)
         w.write_uint32(chunk_size)
         write_symbol_list(w, active_indices)
+        w.write_uint64(enc.state)
+        w.write_uint32(len(words))
+        for word in words:
+            w.write_uint16(word)
+        w.flush()
+        return w.getvalue()
+
+    def _encode_rans_ppm(self, lz_tokens: list[int], n_raw: int) -> bytes:
+        """Per-record PPM-style adaptive order-1 rANS with escape-to-order-0. The order-0 table is Laplace-smoothed over the record's active symbols and always covers every symbol; per-context tables are derived cumulatively from the symbols that followed each previous token, with a PPMC-style count-based escape share (escape mass = number of distinct next-symbols seen in that context), so a low-support context mostly falls through to order-0 and never hurts. Encoding tries the previous token's context table first; an escape from it falls through to the order-0 table. No table is ever transmitted -- both sides derive the identical tables from decoded history, and only contexts with enough cumulative support (MIN_CONTEXT_TRANSITIONS) get a table at all."""
+        active_indices = sorted(set(lz_tokens))
+        local_index = {sym: i for i, sym in enumerate(active_indices)}
+        k = len(active_indices)
+        n = len(lz_tokens)
+        chunk_size = _adaptive_chunk_size(n, k)
+
+        order_counts = [1] * k
+        ctx_counts: dict[int, dict[int, int]] = {}
+        ctx_totals: dict[int, int] = {}
+        chunk_bounds = list(range(0, n, chunk_size)) + [n]
+
+        chunk_order_stats: list[SymbolStats] = []
+        chunk_ctx_tables: list[dict[int, SymbolStats]] = []
+        for c in range(len(chunk_bounds) - 1):
+            order0_stats = SymbolStats(k)
+            order0_stats.normalize(order_counts, sum(order_counts), build_decode_lut=False)
+            chunk_order_stats.append(order0_stats)
+            ctx_tables: dict[int, SymbolStats] = {}
+            for ctx, counts in ctx_counts.items():
+                if ctx_totals[ctx] < MIN_CONTEXT_TRANSITIONS:
+                    continue
+                distinct = len(counts)
+                raw = [0] * (k + 1)
+                for local, cnt in counts.items():
+                    raw[local] = cnt
+                raw[k] = max(1, distinct)  # PPMC-style count-based escape mass
+                st = SymbolStats(k + 1)
+                st.normalize(raw, ctx_totals[ctx] + raw[k], build_decode_lut=False)
+                ctx_tables[ctx] = st
+            chunk_ctx_tables.append(ctx_tables)
+            for j in range(chunk_bounds[c], chunk_bounds[c + 1]):
+                local = local_index[lz_tokens[j]]
+                order_counts[local] += 1
+                if j > 0:
+                    prev = lz_tokens[j - 1]
+                    cc = ctx_counts.setdefault(prev, {})
+                    cc[local] = cc.get(local, 0) + 1
+                    ctx_totals[prev] = ctx_totals.get(prev, 0) + 1
+
+        # rANS encodes in reverse; within one position's cascade the decode
+        # order is context-first then order-0, so the encode calls run order-0
+        # first then the context escape (same lesson as _encode_rans_dict).
+        words: list[int] = []
+        enc = RansEncoder()
+        for c in range(len(chunk_bounds) - 2, -1, -1):
+            order0_stats = chunk_order_stats[c]
+            ctx_tables = chunk_ctx_tables[c]
+            for j in range(chunk_bounds[c + 1] - 1, chunk_bounds[c] - 1, -1):
+                local = local_index[lz_tokens[j]]
+                ctx = ctx_tables.get(lz_tokens[j - 1]) if j > 0 else None
+                if ctx is not None and ctx.freq[local] > 0:
+                    enc.encode_symbol(local, ctx, words)
+                else:
+                    enc.encode_symbol(local, order0_stats, words)
+                    if ctx is not None:
+                        enc.encode_symbol(k, ctx, words)  # context escape slot
+
+        w = BitWriter()
+        self._write_header(w, MODE_RANS_PPM, n_raw)
+        w.write_uint32(n)
+        w.write_uint32(chunk_size)
+        write_symbol_list(w, active_indices)
+        w.write_uint64(enc.state)
+        w.write_uint32(len(words))
+        for word in words:
+            w.write_uint16(word)
+        w.flush()
+        return w.getvalue()
+
+    def _encode_rans_ppm_split(self, lz_tokens: list[int], n_raw: int) -> bytes:
+        """Combines _encode_rans_ppm's order-1 cascade (applied to the literal sub-stream) with _encode_rans_split's match-metadata separation. The literal stream gets the PPM-style order-1 -> order-0 -> out-of-band cascade over a capped local alphabet; match metadata stays in static small tables. The two wins stack: metadata separation helps records where PPM does not, and vice versa."""
+        match_flag = self.tokenizer.match_flag
+        n = len(lz_tokens)
+
+        positions: list[tuple[int, int]] = []
+        role_bits: list[int] = []
+        literals: list[int] = []
+        dist_hi_vals: list[int] = []
+        dist_lo_vals: list[int] = []
+        length_vals: list[int] = []
+        i = 0
+        while i < n:
+            if lz_tokens[i] == match_flag and i + 3 < n:
+                role_bits.append(1)
+                dist_hi_vals.append(lz_tokens[i + 1])
+                dist_lo_vals.append(lz_tokens[i + 2])
+                length_vals.append(lz_tokens[i + 3])
+                positions.append((i, 4))
+                i += 4
+            else:
+                role_bits.append(0)
+                literals.append(lz_tokens[i])
+                positions.append((i, 1))
+                i += 1
+
+        role_stats = SymbolStats(2)
+        role_stats.count_symbols(role_bits, build_decode_lut=False)
+        dist_hi_stats = SymbolStats(256)
+        dist_hi_stats.count_symbols(dist_hi_vals, build_decode_lut=False)
+        dist_lo_stats = SymbolStats(256)
+        dist_lo_stats.count_symbols(dist_lo_vals, build_decode_lut=False)
+        length_stats = SymbolStats(256)
+        length_stats.count_symbols(length_vals, build_decode_lut=False)
+
+        n_lit = len(literals)
+        literal_counts: dict[int, int] = {}
+        for sym in literals:
+            literal_counts[sym] = literal_counts.get(sym, 0) + 1
+        distinct_literals = sorted(literal_counts)
+        if len(distinct_literals) > RANS_M - 2:  # room for order-0 escape (k) and ctx escape (k+1)
+            distinct_literals.sort(key=lambda s: literal_counts[s], reverse=True)
+            distinct_literals = sorted(distinct_literals[: RANS_M - 2])
+        local_index = {sym: idx for idx, sym in enumerate(distinct_literals)}
+        k = len(distinct_literals)
+        local_escape = k  # order-0 escape: value not in the local table -> out-of-band
+
+        coded_literals: list[int] = []
+        escapes: list[int] = []
+        for sym in literals:
+            li = local_index.get(sym)
+            if li is not None:
+                coded_literals.append(li)
+            else:
+                coded_literals.append(local_escape)
+                escapes.append(sym)
+
+        # PPM over the literal stream: cumulative order-0 (Laplace, real symbols
+        # plus a local-escape slot) + per-context (previous literal) tables with
+        # escape-to-order-0 and a PPMC escape share.
+        chunk_size = _adaptive_chunk_size(n_lit, k + 1)
+        order_counts = [1] * (k + 1)  # indices 0..k-1 real, k = local escape
+        ctx_counts: dict[int, dict[int, int]] = {}
+        ctx_totals: dict[int, int] = {}
+        chunk_bounds = list(range(0, n_lit, chunk_size)) + [n_lit]
+
+        chunk_order_stats: list[SymbolStats] = []
+        chunk_ctx_tables: list[dict[int, SymbolStats]] = []
+        chunk_id_of = [0] * n_lit
+        for c in range(len(chunk_bounds) - 1):
+            order0_stats = SymbolStats(k + 1)
+            order0_stats.normalize(list(order_counts), sum(order_counts), build_decode_lut=False)
+            chunk_order_stats.append(order0_stats)
+
+            ctx_tables: dict[int, SymbolStats] = {}
+            for ctx, counts in ctx_counts.items():
+                if ctx_totals[ctx] < MIN_CONTEXT_TRANSITIONS:
+                    continue
+                distinct = len(counts)
+                raw = [0] * (k + 2)  # real 0..k-1, ctx_escape at k, local_escape at k+1
+                for local, cnt in counts.items():
+                    raw[local] = cnt
+                raw[k] = max(1, distinct)  # PPMC ctx escape mass
+                raw[k + 1] = 1  # local escape must be representable in a context table
+                st = SymbolStats(k + 2)
+                st.normalize(raw, ctx_totals[ctx] + raw[k] + 1, build_decode_lut=False)
+                ctx_tables[ctx] = st
+            chunk_ctx_tables.append(ctx_tables)
+
+            for j in range(chunk_bounds[c], chunk_bounds[c + 1]):
+                chunk_id_of[j] = c
+                local = coded_literals[j]
+                order_counts[local] += 1
+                if j > 0:
+                    prev = coded_literals[j - 1]
+                    cc = ctx_counts.setdefault(prev, {})
+                    cc[local] = cc.get(local, 0) + 1
+                    ctx_totals[prev] = ctx_totals.get(prev, 0) + 1
+
+        # Reverse encode. Within one position's cascade the decode order is
+        # context-first then order-0, so the encode calls run order-0 first
+        # then the context escape.
+        words: list[int] = []
+        enc = RansEncoder()
+        lit_idx = n_lit - 1
+        for idx in range(len(positions) - 1, -1, -1):
+            start, span = positions[idx]
+            if span == 4:
+                enc.encode_symbol(lz_tokens[start + 3], length_stats, words)
+                enc.encode_symbol(lz_tokens[start + 2], dist_lo_stats, words)
+                enc.encode_symbol(lz_tokens[start + 1], dist_hi_stats, words)
+                enc.encode_symbol(1, role_stats, words)
+            else:
+                local = coded_literals[lit_idx]
+                c = chunk_id_of[lit_idx]
+                order0_stats = chunk_order_stats[c]
+                ctx_tables = chunk_ctx_tables[c]
+                ctx = ctx_tables.get(coded_literals[lit_idx - 1]) if lit_idx > 0 else None
+                if local == local_escape:
+                    enc.encode_symbol(local_escape, order0_stats, words)
+                    if ctx is not None:
+                        enc.encode_symbol(k + 1, ctx, words)  # ctx local-escape slot
+                elif ctx is not None and ctx.freq[local] > 0:
+                    enc.encode_symbol(local, ctx, words)
+                else:
+                    enc.encode_symbol(local, order0_stats, words)
+                    if ctx is not None:
+                        enc.encode_symbol(k, ctx, words)  # ctx escape slot
+                enc.encode_symbol(0, role_stats, words)
+                lit_idx -= 1
+        escapes.reverse()
+
+        w = BitWriter()
+        self._write_header(w, MODE_RANS_PPM_SPLIT, n_raw)
+        w.write_uint32(n)
+        w.write_uint32(len(positions))
+        w.write_uint32(n_lit)
+        w.write_uint32(chunk_size)
+        write_symbol_list(w, distinct_literals)
+        self._write_small_table(w, dist_hi_stats)
+        self._write_small_table(w, dist_lo_stats)
+        self._write_small_table(w, length_stats)
+        self._write_small_table(w, role_stats)
+        w.write_uint32(len(escapes))
+        for sym in escapes:
+            w.write_uint32(sym)
         w.write_uint64(enc.state)
         w.write_uint32(len(words))
         for word in words:

@@ -25,13 +25,12 @@ _FINGERPRINT_SIZE = 8
 # record isn't disproportionately expensive.
 _ORDER0_ESCAPE_SHARE = 0.015
 
-# Context tables are trained on far fewer observations per context than the
-# order-0 table sees overall, so "this specific transition wasn't in
-# training" is a common event for them, not a rare one. Measured directly:
-# 0.015 (the order-0 share) actively made order-1 conditioning worse than
-# order-0-only, while 0.3-0.4 gave a 6-8% improvement. Do not reuse
-# _ORDER0_ESCAPE_SHARE here without re-measuring.
-_CONTEXT_ESCAPE_SHARE = 0.35
+# Context tables use an adaptive, PPMC-style count-based escape share
+# (see _build_table's adaptive_escape parameter) instead of a fixed share,
+# since a context table sees far fewer observations per symbol than the
+# order-0 table does, so "this specific transition wasn't in training" is a
+# common event for it, not a rare one. The old fixed 0.35 share was tuned by
+# a parameter sweep; the adaptive estimate reproduces it without the sweep.
 
 # Order-1 context tables: only build one for a (previous-token) context that
 # was actually observed often enough in training to predict confidently, and
@@ -117,7 +116,12 @@ class TokDict:
                 ctx_raw_counts[sym] = count
                 ctx_total += count
             context_stats[ctx] = cls._build_table(
-                dict_alphabet_size, real_alphabet_size, escape_symbol, ctx_raw_counts, ctx_total, _CONTEXT_ESCAPE_SHARE
+                dict_alphabet_size,
+                real_alphabet_size,
+                escape_symbol,
+                ctx_raw_counts,
+                ctx_total,
+                adaptive_escape=True,
             )
 
         fingerprint = cls._fingerprint(priming_tokens, raw_counts, context_stats)
@@ -130,15 +134,22 @@ class TokDict:
         escape_symbol: int,
         raw_counts: list[int],
         total: int,
-        escape_share: float,
+        escape_share: float | None = None,
+        adaptive_escape: bool = False,
     ) -> SymbolStats:
-        """Cap a raw per-symbol count array to RANS_M-1 real symbols plus a reserved escape slot, then normalize. Shared by the order-0 table and every order-1 context table (same escape-capping pattern as codec/encoder.py's _encode_rans_sparse). escape_share differs sharply between the two callers -- see _ORDER0_ESCAPE_SHARE/_CONTEXT_ESCAPE_SHARE's comments."""
+        """Cap a raw per-symbol count array to RANS_M-1 real symbols plus a reserved escape slot, then normalize. Shared by the order-0 table and every order-1 context table (same escape-capping pattern as codec/encoder.py's _encode_rans_sparse).
+
+        The escape probability mass is either a fixed share (escape_share, used by the order-0 table) or a PPMC-style count-based estimate (adaptive_escape=True, used by context tables): escape mass = number of distinct real symbols, i.e. p_escape = distinct / (total + distinct). A context table sees few observations per symbol, so its escape share is naturally larger than order-0's -- exactly the behavior the hand-tuned 0.35 share was approximating, without the sweep.
+        """
         raw_counts = list(raw_counts)
-        escape_count = max(1, round(total * escape_share))
+        distinct_real = [i for i in range(real_alphabet_size) if raw_counts[i] > 0]
+        if adaptive_escape:
+            escape_count = max(1, len(distinct_real))
+        else:
+            escape_count = max(1, round(total * escape_share))
         raw_counts[escape_symbol] += escape_count
         total += escape_count
 
-        distinct_real = [i for i in range(real_alphabet_size) if raw_counts[i] > 0]
         if len(distinct_real) > RANS_M - 1:
             distinct_real.sort(key=lambda i: raw_counts[i], reverse=True)
             for i in distinct_real[RANS_M - 1 :]:

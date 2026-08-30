@@ -7,7 +7,7 @@ RANS_M = 1 << RANS_M_BITS  # 65536
 
 
 class SymbolStats:
-    __slots__ = ("freq", "cum_freq", "total_freq", "alphabet_size", "slot_to_symbol")
+    __slots__ = ("freq", "cum_freq", "total_freq", "alphabet_size", "slot_to_symbol", "active")
 
     def __init__(self, alphabet_size: int) -> None:
         self.alphabet_size = alphabet_size
@@ -15,6 +15,7 @@ class SymbolStats:
         self.cum_freq = [0] * (alphabet_size + 1)
         self.total_freq = 0
         self.slot_to_symbol: list[int] = []
+        self.active: list[int] = []  # symbol ids with freq > 0, in ascending order
 
     def count_symbols(self, symbols: list[int], build_decode_lut: bool = True) -> None:
         raw_counts = [0] * self.alphabet_size
@@ -27,11 +28,12 @@ class SymbolStats:
         self.normalize(raw_counts, total_symbols, build_decode_lut)
 
     def normalize(self, raw_counts: list[int], total_symbols: int, build_decode_lut: bool = True) -> None:
-        """Scale a raw per-symbol count array (len == alphabet_size) to sum to RANS_M. Shared by count_symbols (per-record) and TokDict.train (dictionary-wide) so the RANS_M-feasibility invariant is enforced in one place."""
+        """Scale a raw per-symbol count array (len == alphabet_size) to sum to RANS_M. Shared by count_symbols (per-record) and TokDict.train (dictionary-wide) so the RANS_M-feasibility invariant is enforced in one place. Only active (count > 0) symbols are iterated, and `active` records which those are so callers never rescan the full (up to ~200k) alphabet."""
         if total_symbols == 0:
             return
 
-        distinct = sum(1 for c in raw_counts if c > 0)
+        active = [i for i in range(self.alphabet_size) if raw_counts[i] > 0]
+        distinct = len(active)
         if distinct > RANS_M:
             raise ValueError(
                 f"{distinct} distinct symbols exceeds RANS_M={RANS_M}: "
@@ -44,25 +46,22 @@ class SymbolStats:
         target_sum = RANS_M
         max_allowed_freq = target_sum - 1
         current_sum = 0
-        active_indices = []
-        for i in range(self.alphabet_size):
-            if raw_counts[i] > 0:
-                scaled = (raw_counts[i] * target_sum) // total_symbols
-                f = scaled
-                if f == 0:
-                    f = 1
-                elif f > max_allowed_freq:
-                    f = max_allowed_freq
-                self.freq[i] = f
-                current_sum += f
-                active_indices.append(i)
+        for i in active:
+            scaled = (raw_counts[i] * target_sum) // total_symbols
+            f = scaled
+            if f == 0:
+                f = 1
+            elif f > max_allowed_freq:
+                f = max_allowed_freq
+            self.freq[i] = f
+            current_sum += f
 
-        if current_sum != target_sum and active_indices:
-            true_ceiling = target_sum - (len(active_indices) - 1)
+        if current_sum != target_sum:
+            true_ceiling = target_sum - (distinct - 1)
             diff = target_sum - current_sum
             cursor = 0
             while diff != 0:
-                i = active_indices[cursor % len(active_indices)]
+                i = active[cursor % distinct]
                 if diff > 0 and self.freq[i] < true_ceiling:
                     self.freq[i] += 1
                     diff -= 1
@@ -71,17 +70,18 @@ class SymbolStats:
                     diff += 1
                 cursor += 1
 
+        self.active = active
         self.finalize_cum_freq(build_decode_lut)
 
     def finalize_cum_freq(self, build_decode_lut: bool = True) -> None:
-        cum = 0
-        for i in range(self.alphabet_size):
-            self.cum_freq[i] = cum
-            cum += self.freq[i]
-        self.cum_freq[self.alphabet_size] = cum
-        self.total_freq = cum
-
         if build_decode_lut:
+            cum = 0
+            for i in range(self.alphabet_size):
+                self.cum_freq[i] = cum
+                cum += self.freq[i]
+            self.cum_freq[self.alphabet_size] = cum
+            self.total_freq = cum
+
             slot_to_symbol = [0] * cum
             pos = 0
             for i in range(self.alphabet_size):
@@ -90,6 +90,16 @@ class SymbolStats:
                     slot_to_symbol[pos] = i
                     pos += 1
             self.slot_to_symbol = slot_to_symbol
+        else:
+            # Encode path: rANS only reads cum_freq at active symbols, so
+            # compute the cumulative only where a symbol is present instead of
+            # walking the whole (up to ~200k) alphabet per table.
+            cum = 0
+            for i in self.active:
+                self.cum_freq[i] = cum
+                cum += self.freq[i]
+            self.cum_freq[self.alphabet_size] = cum
+            self.total_freq = cum
 
     def find_symbol(self, slot: int) -> int:
         return self.slot_to_symbol[slot]

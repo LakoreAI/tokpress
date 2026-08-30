@@ -22,6 +22,7 @@ Nothing is substituted with synthetic data.
 import bz2
 import gzip
 import lzma
+import random
 import re
 import statistics
 import subprocess
@@ -558,6 +559,54 @@ def run_cross_schema_generalization() -> None:
         print(f"{'zstd (no dict / dict variants)':<48} SKIPPED (zstd binary not found)")
 
 
+def _synthetic_records(target_size: int, n: int, seed: int) -> list[bytes]:
+    """Schema-homogeneous records of approximately `target_size` bytes: a fixed
+    JSON-like key set with a randomized payload. Used by run_size_sweep to
+    measure the crossover N* across record sizes."""
+    rng = random.Random(seed)
+    records = []
+    for i in range(n):
+        fixed = f'{{"id": {i}, "ts": {1700000000 + i}, "action": "click", "page": "/home", "region": "eu-west", "payload": "'
+        suffix = '"}'
+        plen = target_size - len(fixed) - len(suffix)
+        payload = "".join(rng.choice("abcdefghijklmnopqrstuvwxyz0123456789 ") for _ in range(max(0, plen)))
+        records.append((fixed + payload + suffix).encode())
+    return records
+
+
+def run_size_sweep() -> None:
+    """Locate the record-size crossover N*: the size above which a trained
+    static model (TokDict) beats per-record adaptive compression. Uses
+    synthetic schema-homogeneous records at increasing sizes; every backend
+    runs per-record on the same held-out records."""
+    sizes = [64, 128, 256, 512, 1024, 2048, 4096]
+    print("\n=== size crossover sweep (per-record ratio by record size) ===")
+    print(f"{'record size':<14} {'tokpress':>10} {'+dict':>10} {'zstd':>10} {'zstd+dict':>10}")
+    for size in sizes:
+        train = _synthetic_records(size, 30, seed=1)
+        test = _synthetic_records(size, 10, seed=2)
+        total_raw = sum(len(r) for r in test)
+
+        enc = TokPressEncoder()
+        per = sum(len(enc.compress(r)) for r in test)
+
+        tokdict = TokDict.train(train)
+        enc_d = TokPressEncoder(dictionary=tokdict)
+        per_dict = sum(len(enc_d.compress(r)) for r in test)
+
+        z_no = z_d = "n/a"
+        if ZSTD_AVAILABLE:
+            z_no = f"{sum(len(backend_zstd(r)) for r in test) / total_raw:.3f}"
+            zd = _zstd_train_dict(train)
+            if zd is not None:
+                with tempfile.NamedTemporaryFile(suffix=".dict") as f:
+                    f.write(zd)
+                    f.flush()
+                    z_d = f"{sum(len(subprocess.run(['zstd', '-19', '-D', f.name, '-c'], input=r, capture_output=True, check=True).stdout) for r in test) / total_raw:.3f}"
+
+        print(f"{size:>6}B      {per / total_raw:>10.3f} {per_dict / total_raw:>10.3f} {z_no:>10} {z_d:>10}")
+
+
 def main() -> None:
     if not DATA_ROOT.is_dir():
         print(f"Vendored corpus root not found at {DATA_ROOT} -- no corpora available.")
@@ -574,6 +623,7 @@ def main() -> None:
     run_many_small_records()
     run_paper_scale_dictionary_regime()
     run_cross_schema_generalization()
+    run_size_sweep()
 
 
 if __name__ == "__main__":

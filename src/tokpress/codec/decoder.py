@@ -1,7 +1,7 @@
 """Decoder: exact mirror of encoder.py's wire format."""
 
 from ..bitstream import BitReader, read_symbol_list
-from ..dictionary import TokDict
+from ..dictionary import MIN_CONTEXT_TRANSITIONS, TokDict
 from ..entropy.frequency import SymbolStats
 from ..entropy.rans import RANS_M_BITS, RansDecoder
 from ..tokenizer.tiktoken_adapter import TiktokenTokenizer
@@ -9,6 +9,8 @@ from .encoder import (
     MODE_RANS_ADAPTIVE,
     MODE_RANS_ADAPTIVE_SPLIT,
     MODE_RANS_DICT,
+    MODE_RANS_PPM,
+    MODE_RANS_PPM_SPLIT,
     MODE_RANS_SPARSE,
     MODE_RANS_SPLIT,
     MODE_RAW_FALLBACK,
@@ -107,6 +109,56 @@ class TokPressDecoder:
                 pos = end
             priming = []
 
+        elif mode == MODE_RANS_PPM:
+            chunk_size = r.read_uint32()
+            active_indices = read_symbol_list(r)
+            k = len(active_indices)
+
+            rans_state = r.read_uint64()
+            num_words = r.read_uint32()
+            words = [r.read_uint16() for _ in range(num_words)]
+            dec = RansDecoder(rans_state, words)
+
+            order_counts = [1] * k
+            ctx_counts: dict[int, dict[int, int]] = {}
+            ctx_totals: dict[int, int] = {}
+            lz_tokens = []
+            pos = 0
+            while pos < num_lz_tokens:
+                end = min(pos + chunk_size, num_lz_tokens)
+                order0_stats = SymbolStats(k)
+                order0_stats.normalize(order_counts, sum(order_counts), build_decode_lut=True)
+                ctx_tables = {}
+                for ctx, counts in ctx_counts.items():
+                    if ctx_totals[ctx] < MIN_CONTEXT_TRANSITIONS:
+                        continue
+                    distinct = len(counts)
+                    raw = [0] * (k + 1)
+                    for local, cnt in counts.items():
+                        raw[local] = cnt
+                    raw[k] = max(1, distinct)
+                    st = SymbolStats(k + 1)
+                    st.normalize(raw, ctx_totals[ctx] + raw[k], build_decode_lut=True)
+                    ctx_tables[ctx] = st
+                for _ in range(pos, end):
+                    prev = lz_tokens[-1] if lz_tokens else None
+                    ctx = ctx_tables.get(prev) if prev is not None else None
+                    if ctx is not None:
+                        local = dec.decode_symbol(ctx)
+                        if local == k:  # context escape -> order-0
+                            local = dec.decode_symbol(order0_stats)
+                    else:
+                        local = dec.decode_symbol(order0_stats)
+                    sym = active_indices[local]
+                    lz_tokens.append(sym)
+                    order_counts[local] += 1
+                    if prev is not None:
+                        cc = ctx_counts.setdefault(prev, {})
+                        cc[local] = cc.get(local, 0) + 1
+                        ctx_totals[prev] = ctx_totals.get(prev, 0) + 1
+                pos = end
+            priming = []
+
         elif mode == MODE_RANS_SPLIT:
             num_events = r.read_uint32()
             match_flag = self.tokenizer.match_flag
@@ -200,6 +252,88 @@ class TokPressDecoder:
                         escape_pos += 1
                     else:
                         sym = distinct_literals[local_sym]
+                    lz_tokens.append(sym)
+            priming = []
+
+        elif mode == MODE_RANS_PPM_SPLIT:
+            num_events = r.read_uint32()
+            n_lit = r.read_uint32()
+            chunk_size = r.read_uint32()
+            match_flag = self.tokenizer.match_flag
+
+            distinct_literals = read_symbol_list(r)
+            k = len(distinct_literals)
+            local_escape = k
+
+            dist_hi_stats = self._read_small_table(r, 256)
+            dist_lo_stats = self._read_small_table(r, 256)
+            length_stats = self._read_small_table(r, 256)
+            role_stats = self._read_small_table(r, 2)
+
+            num_escapes = r.read_uint32()
+            escapes = [r.read_uint32() for _ in range(num_escapes)]
+
+            rans_state = r.read_uint64()
+            num_words = r.read_uint32()
+            words = [r.read_uint16() for _ in range(num_words)]
+            dec = RansDecoder(rans_state, words)
+
+            order_counts = [1] * (k + 1)
+            ctx_counts: dict[int, dict[int, int]] = {}
+            ctx_totals: dict[int, int] = {}
+            lit_pos = 0
+            next_chunk_boundary = 0
+            order0_stats: SymbolStats | None = None
+            ctx_tables: dict[int, SymbolStats] = {}
+            prev_lit: int | None = None
+            escape_pos = 0
+            lz_tokens = []
+            for _ in range(num_events):
+                role = dec.decode_symbol(role_stats)
+                if role == 1:
+                    dist_hi = dec.decode_symbol(dist_hi_stats)
+                    dist_lo = dec.decode_symbol(dist_lo_stats)
+                    length = dec.decode_symbol(length_stats)
+                    lz_tokens.extend([match_flag, dist_hi, dist_lo, length])
+                else:
+                    if lit_pos == next_chunk_boundary:
+                        order0_stats = SymbolStats(k + 1)
+                        order0_stats.normalize(list(order_counts), sum(order_counts), build_decode_lut=True)
+                        ctx_tables = {}
+                        for ctx, counts in ctx_counts.items():
+                            if ctx_totals[ctx] < MIN_CONTEXT_TRANSITIONS:
+                                continue
+                            distinct = len(counts)
+                            raw = [0] * (k + 2)
+                            for local, cnt in counts.items():
+                                raw[local] = cnt
+                            raw[k] = max(1, distinct)
+                            raw[k + 1] = 1
+                            st = SymbolStats(k + 2)
+                            st.normalize(raw, ctx_totals[ctx] + raw[k] + 1, build_decode_lut=True)
+                            ctx_tables[ctx] = st
+                        next_chunk_boundary = min(lit_pos + chunk_size, n_lit)
+                    ctx = ctx_tables.get(prev_lit) if prev_lit is not None else None
+                    if ctx is not None:
+                        local = dec.decode_symbol(ctx)
+                        if local == k:  # ctx escape -> order-0
+                            local = dec.decode_symbol(order0_stats)
+                        elif local == k + 1:  # ctx local-escape -> order-0 local-escape
+                            local = dec.decode_symbol(order0_stats)
+                    else:
+                        local = dec.decode_symbol(order0_stats)
+                    order_counts[local] += 1
+                    if prev_lit is not None:
+                        cc = ctx_counts.setdefault(prev_lit, {})
+                        cc[local] = cc.get(local, 0) + 1
+                        ctx_totals[prev_lit] = ctx_totals.get(prev_lit, 0) + 1
+                    prev_lit = local
+                    lit_pos += 1
+                    if local == local_escape:
+                        sym = escapes[escape_pos]
+                        escape_pos += 1
+                    else:
+                        sym = distinct_literals[local]
                     lz_tokens.append(sym)
             priming = []
 
