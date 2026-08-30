@@ -17,6 +17,7 @@ import bz2
 import gzip
 import lzma
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -102,6 +103,29 @@ def backend_zstd(data: bytes) -> bytes:
     return proc.stdout
 
 
+try:
+    import brotli as _brotli
+
+    BROTLI_AVAILABLE = True
+except ImportError:
+    BROTLI_AVAILABLE = False
+
+try:
+    import lz4.frame as _lz4
+
+    LZ4_AVAILABLE = True
+except ImportError:
+    LZ4_AVAILABLE = False
+
+
+def backend_brotli(data: bytes) -> bytes:
+    return _brotli.compress(data, quality=11)
+
+
+def backend_lz4(data: bytes) -> bytes:
+    return _lz4.compress(data)
+
+
 _tt = TiktokenTokenizer()
 _PACK_WIDTH = 3  # bytes/token; o200k_base's match_flag (~200019) fits in 3 bytes (max 16777215)
 
@@ -147,6 +171,10 @@ BACKENDS = {
     "parmar_style (tiktoken+pack+lzma)": (backend_parmar_style, parmar_style_roundtrip_ok),
     "tokpress": (backend_tokpress, tokpress_roundtrip_ok),
 }
+if BROTLI_AVAILABLE:
+    BACKENDS["brotli_11"] = (backend_brotli, None)
+if LZ4_AVAILABLE:
+    BACKENDS["lz4"] = (backend_lz4, None)
 
 
 def _row(name: str, size: int, ratio: float, mean_ms: float, stdev_ms: float, ok) -> str:
@@ -236,22 +264,22 @@ def _zstd_train_dict(train_records: list[bytes], max_dict_size: int = 16384) -> 
         return dict_path.read_bytes()
 
 
-def run_trained_dictionary_regime(lines: list[bytes]) -> None:
+def run_trained_dictionary_regime(lines: list[bytes], split_frac: float = 0.7, label: str = "") -> None:
     """The regime docs/VISION.md actually claims (MongoDB per-collection zstd
     dictionaries / SCHC): train once on a sample of records, then measure
     compression on records the dictionary has never seen. Splits the corpus
     so training and evaluation never touch the same records.
     """
     if len(lines) < 10:
-        print(f"\n=== trained-dictionary regime: SKIPPED (only {len(lines)} records, need >= 10) ===")
+        print(f"\n=== trained-dictionary regime{label}: SKIPPED (only {len(lines)} records, need >= 10) ===")
         return
 
-    split = int(len(lines) * 0.7)
+    split = int(len(lines) * split_frac)
     train_records, test_records = lines[:split], lines[split:]
     total_raw = sum(len(r) for r in test_records)
 
     print(
-        f"\n=== trained-dictionary regime ({len(train_records)} train / "
+        f"\n=== trained-dictionary regime{label} ({len(train_records)} train / "
         f"{len(test_records)} held-out test records, {total_raw} test bytes) ==="
     )
     print_header()
@@ -324,8 +352,103 @@ def run_trained_dictionary_regime(lines: list[bytes]) -> None:
     n_active = sum(1 for f in tokdict.stats.freq if f > 0)
     print(
         _row("tokpress+dict", total_compressed, total_compressed / total_raw, mean_ms, stdev_ms, ok)
-        + f"  (priming {len(tokdict.priming_tokens)} tok, table {n_active} sym)"
+        + f"  (priming {len(tokdict.priming_tokens)} tok, {len(tokdict.context_stats)} ctx tables, table {n_active} sym)"
     )
+
+
+def run_paper_scale_dictionary_regime() -> None:
+    """docs/research.tex (a predecessor system's paper) reports its final
+    target-regime number on this exact file (json_heldout.jsonl) at an
+    80/20 train/test split, 230 total records. Running the same file and
+    split on the current architecture gives the most directly comparable
+    number available for docs/research.tex's claims.
+    """
+    path = TOKENZIP_ROOT / "benchmarks/real_data/json_heldout.jsonl"
+    if not path.is_file():
+        print(f"\n=== paper-scale dictionary regime: SKIPPED (corpus not found at {path}) ===")
+        return
+    lines = [line for line in path.read_bytes().split(b"\n") if line]
+    run_trained_dictionary_regime(lines, split_frac=0.8, label=" (paper-scale, json_heldout.jsonl)")
+
+
+def _code_snippet_records(min_size: int = 100, max_size: int = 2000) -> list[bytes]:
+    path = TOKENZIP_ROOT / "benchmarks/real_data/real_python_code.py"
+    if not path.is_file():
+        return []
+    parts = re.split(r"\n(?=def |class )", path.read_text())
+    return [p.strip().encode() for p in parts if min_size <= len(p.strip()) <= max_size]
+
+
+def run_cross_schema_generalization() -> None:
+    """docs/research.tex's predecessor system reported that a dictionary
+    trained on one schema (JSON logs) barely helps -- and can be worse than
+    a dictionary trained on the *right* schema by ~2x -- on records of a
+    different schema. Reproduces the same style of test on the current
+    architecture: a TokDict trained on JSON log records, applied to Python
+    code snippets (a genuinely different schema, not just a different JSON
+    shape), compared against a TokDict trained on matching code snippets and
+    against zstd with no dictionary / a wrong-schema dictionary / a
+    matched-schema dictionary.
+    """
+    json_path = TOKENZIP_ROOT / "benchmarks/real_data/json_heldout.jsonl"
+    if not json_path.is_file():
+        print("\n=== cross-schema generalization: SKIPPED (json_heldout.jsonl not found) ===")
+        return
+    json_lines = [line for line in json_path.read_bytes().split(b"\n") if line]
+    code_records = _code_snippet_records()
+    if len(json_lines) < 20 or len(code_records) < 20:
+        print("\n=== cross-schema generalization: SKIPPED (not enough records in one of the corpora) ===")
+        return
+
+    json_train = json_lines[: int(len(json_lines) * 0.8)]
+    split = int(len(code_records) * 0.8)
+    code_train, code_test = code_records[:split], code_records[split:]
+    total_raw = sum(len(r) for r in code_test)
+
+    print(
+        f"\n=== cross-schema generalization (dict trained on {len(json_train)} JSON records "
+        f"or {len(code_train)} matched code records, evaluated on {len(code_test)} held-out "
+        f"code-snippet records, {total_raw} bytes) ==="
+    )
+    print(f"{'method':<48} {'bytes':>12} {'ratio':>8}")
+
+    def _eval_tokdict(d: TokDict) -> tuple[int, bool]:
+        enc = TokPressEncoder(dictionary=d)
+        dec = TokPressDecoder(dictionary=d)
+        total = 0
+        ok = True
+        for r in code_test:
+            c = enc.compress(r)
+            ok = ok and dec.decompress(c) == r
+            total += len(c)
+        return total, ok
+
+    d_json = TokDict.train(json_train)
+    d_code = TokDict.train(code_train)
+    for label, d in (("tokpress+dict (json-trained, WRONG schema)", d_json), ("tokpress+dict (code-trained, matched)", d_code)):
+        total, ok = _eval_tokdict(d)
+        print(f"{label:<48} {total:>12} {total / total_raw:>8.4f}{'  OK' if ok else '  MISMATCH'}")
+
+    if ZSTD_AVAILABLE:
+        no_dict_total = sum(len(backend_zstd(r)) for r in code_test)
+        print(f"{'zstd_19, no dictionary':<48} {no_dict_total:>12} {no_dict_total / total_raw:>8.4f}")
+
+        zd_json = _zstd_train_dict(json_train)
+        zd_code = _zstd_train_dict(code_train)
+        for label, zd in (("zstd_19+dict (json-trained, WRONG schema)", zd_json), ("zstd_19+dict (code-trained, matched)", zd_code)):
+            if zd is None:
+                print(f"{label:<48} ERROR: zstd --train failed")
+                continue
+            with tempfile.NamedTemporaryFile(suffix=".dict") as f:
+                f.write(zd)
+                f.flush()
+                total = sum(
+                    len(subprocess.run(["zstd", "-19", "-D", f.name, "-c"], input=r, capture_output=True, check=True).stdout)
+                    for r in code_test
+                )
+            print(f"{label:<48} {total:>12} {total / total_raw:>8.4f}")
+    else:
+        print(f"{'zstd (no dict / dict variants)':<48} SKIPPED (zstd binary not found)")
 
 
 def main() -> None:
@@ -342,6 +465,8 @@ def main() -> None:
         run_whole_file(name, path.read_bytes())
 
     run_many_small_records()
+    run_paper_scale_dictionary_regime()
+    run_cross_schema_generalization()
 
 
 if __name__ == "__main__":

@@ -36,6 +36,32 @@ def test_dict_roundtrip_with_wholly_novel_content():
     assert dec.decompress(compressed) == record
 
 
+def test_context_tables_are_built():
+    """Sanity check that training on repetitive-enough data actually
+    produces order-1 context tables -- otherwise the roundtrip tests below
+    would only ever exercise the order-0 path."""
+    d = TokDict.train(TRAIN_RECORDS)
+    assert len(d.context_stats) > 0
+
+
+def test_dict_roundtrip_many_held_out_records():
+    """Regression test for a rANS reverse-encode ordering bug: a cascading
+    position (context table escapes to order-0) emits two logical events,
+    and the *encode calls* for those two events must happen in the opposite
+    micro-order from how the decoder consumes them, since rANS encodes in
+    reverse overall. A single fixed record didn't reliably exercise the
+    escape-from-context path; looping over many varied held-out records
+    does."""
+    d = TokDict.train(TRAIN_RECORDS)
+    enc = TokPressEncoder(dictionary=d)
+    dec = TokPressDecoder(dictionary=d)
+
+    for i in range(900, 950):
+        record = f'{{"user": "u{i}", "action": "click", "page": "/home", "ts": {1700000000 + i}}}'.encode()
+        compressed = enc.compress(record)
+        assert dec.decompress(compressed) == record
+
+
 def test_dict_beats_no_dict_on_homogeneous_records():
     d = TokDict.train(TRAIN_RECORDS)
     enc_dict = TokPressEncoder(dictionary=d)
