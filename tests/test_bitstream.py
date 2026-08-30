@@ -1,3 +1,5 @@
+import pytest
+
 from tokpress.bitstream import BitReader, BitWriter
 
 
@@ -25,3 +27,16 @@ def test_bitstream_byte_uint16_uint32_helpers():
     assert r.read_byte() == 0xAB
     assert r.read_uint16() == 0xBEEF
     assert r.read_uint32() == 0xDEADBEEF
+
+
+def test_bitstream_read_beyond_data_raises():
+    """Regression: reading past the end of a (truncated/corrupt) stream used
+    to silently return zero-padded garbage instead of raising."""
+    w = BitWriter()
+    w.write_uint16(0x1234)
+    w.flush()
+    r = BitReader(w.getvalue())
+
+    assert r.read_uint16() == 0x1234
+    with pytest.raises(ValueError):
+        r.read_uint32()

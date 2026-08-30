@@ -16,6 +16,8 @@ class BitReader:
     def read_bits(self, count: int) -> int:
         if self._bit_count < count:
             self._refill()
+        if self._bit_count < count:
+            raise ValueError(f"truncated bitstream: requested {count} bits but only {self._bit_count} remain")
         mask = (1 << count) - 1
         result = self._bit_buf & mask
         self._bit_buf >>= count

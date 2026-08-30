@@ -188,9 +188,7 @@ class TokDict:
         return stats
 
     @staticmethod
-    def _fingerprint(
-        priming_tokens: list[int], raw_counts: list[int], context_stats: dict[int, SymbolStats]
-    ) -> bytes:
+    def _fingerprint(priming_tokens: list[int], raw_counts: list[int], context_stats: dict[int, SymbolStats]) -> bytes:
         h = hashlib.blake2b(digest_size=_FINGERPRINT_SIZE)
         if priming_tokens:
             h.update(struct.pack(f"<{len(priming_tokens)}I", *priming_tokens))

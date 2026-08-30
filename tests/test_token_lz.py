@@ -1,3 +1,5 @@
+import pytest
+
 from tokpress.codec.token_lz import TokenLZMatch
 
 
@@ -40,3 +42,26 @@ def test_token_lz_empty_input():
     lz = TokenLZMatch()
     assert lz.encode([], []) == []
     assert lz.decode([], []) == []
+
+
+def test_token_lz_decode_rejects_bad_match_distance():
+    """Regression: a malformed stream with a match distance beyond the decoded
+    history used to index the output list negatively (silently corrupting the
+    result, or crashing with IndexError) instead of raising."""
+    lz = TokenLZMatch()
+    flag = lz.match_flag
+    # distance 0xFF00 >> nothing in history: start = len(output) - 65280 < 0
+    corrupt = [flag, 0xFF, 0x00, 5]
+    with pytest.raises(ValueError):
+        lz.decode(corrupt, [])
+
+
+def test_token_lz_decode_rejects_zero_length_match():
+    """A (match_flag, dist_hi, dist_lo, length) tuple with length==0 and a
+    nonzero distance is malformed: the encoder only emits that tuple shape
+    for the escaped-literal case (dist==0, length==0)."""
+    lz = TokenLZMatch()
+    flag = lz.match_flag
+    corrupt = [flag, 0x00, 0x10, 0]
+    with pytest.raises(ValueError):
+        lz.decode(corrupt, [])

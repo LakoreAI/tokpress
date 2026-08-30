@@ -18,6 +18,10 @@ Options:
   -o, --output <PATH>     Specify output filepath
   --dict <PATH>           Use a TokDict trained cross-record dictionary
                           (see `train-dict`) for compress/decompress
+
+train-dict: each sample file is read as records. UTF-8 newline-delimited
+files (files with two or more newlines, e.g. .jsonl logs) are split per
+line into individual records; any other file is treated as one record.
 """
 
 
@@ -124,6 +128,31 @@ def cmd_bench(args: list[str]) -> int:
     return 0 if result["lossless"] else 1
 
 
+def _load_sample_records(path: str) -> list[bytes]:
+    """Read one train-dict sample path as a list of records.
+
+    Newline-delimited text files (valid UTF-8 with two or more newlines --
+    e.g. .jsonl logs) are split per line into individual records, since that
+    is the project's core many-small-records regime; anything else (binary
+    data, a single-line record) is kept whole. A file of N records must
+    train the dictionary on N independent records, not on one giant blob.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return [data]
+    if data.count(b"\n") >= 2:
+        lines = data.split(b"\n")
+        if lines and lines[-1] == b"":
+            lines.pop()
+        records = [line.rstrip(b"\r") for line in lines if line]
+        if records:
+            return records
+    return [data]
+
+
 def cmd_train_dict(args: list[str]) -> int:
     if len(args) < 4:
         print("Error: usage: tokpress train-dict <output.tokdict> <sample_path> [sample_path ...]")
@@ -134,8 +163,7 @@ def cmd_train_dict(args: list[str]) -> int:
 
     samples = []
     for path in sample_paths:
-        with open(path, "rb") as f:
-            samples.append(f.read())
+        samples.extend(_load_sample_records(path))
 
     dictionary = TokDict.train(samples)
     dictionary.save(output_path)

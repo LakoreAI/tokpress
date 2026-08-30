@@ -2,16 +2,11 @@ from tokpress.codec.decoder import TokPressDecoder
 from tokpress.codec.encoder import TokPressEncoder
 
 CODE_PAYLOAD = (
-    b"import std::io\n"
-    b"def main():\n"
-    b"    print('Hello TokPress!')\n"
-    b"    for i in range(10):\n"
-    b"        print(i)\n"
+    b"import std::io\ndef main():\n    print('Hello TokPress!')\n    for i in range(10):\n        print(i)\n"
 ) * 5
 
 JSON_PAYLOAD = (
-    b'{"name": "example-pkg", "version": "1.2.3", "license": "MIT", '
-    b'"dependencies": {"foo": "^1.0.0", "bar": "^2.3.1"}}'
+    b'{"name": "example-pkg", "version": "1.2.3", "license": "MIT", "dependencies": {"foo": "^1.0.0", "bar": "^2.3.1"}}'
 ) * 5
 
 

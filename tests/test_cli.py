@@ -43,3 +43,41 @@ def test_cli_bench(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "lossless:" in res.stdout
     assert "OK" in res.stdout
+
+
+def test_cli_train_dict_splits_jsonl_into_records(tmp_path):
+    """A .jsonl sample file must train on its individual records, not on the
+    whole file as one giant record -- the project's core many-small-records
+    regime. Before the fix, 'samples: N' reflected the number of files, so a
+    single jsonl logged only 1 sample."""
+    jsonl = tmp_path / "logs.jsonl"
+    lines = []
+    for i in range(40):
+        lines.append(f'{{"user": "u{i}", "action": "click", "ts": {1700000000 + i}}}')
+    jsonl.write_text("\n".join(lines) + "\n")
+
+    dict_file = tmp_path / "dict.tokdict"
+    res = _run("train-dict", str(dict_file), str(jsonl))
+    assert res.returncode == 0, res.stderr
+    assert "samples:         40" in res.stdout
+
+    # a held-out record of the same shape must round-trip through the CLI
+    heldout = tmp_path / "heldout.jsonl"
+    heldout.write_text('{"user": "u99", "action": "click", "ts": 1700000099}\n')
+    tokz = tmp_path / "heldout.tokz"
+    restored = tmp_path / "restored.jsonl"
+
+    assert _run("compress", str(heldout), "-o", str(tokz), "--dict", str(dict_file)).returncode == 0
+    assert _run("decompress", str(tokz), "-o", str(restored), "--dict", str(dict_file)).returncode == 0
+    assert restored.read_bytes() == heldout.read_bytes()
+
+
+def test_cli_train_dict_single_binary_record_stays_whole(tmp_path):
+    """A binary sample with no newlines must stay one record, not be split."""
+    blob = tmp_path / "blob.bin"
+    blob.write_bytes(bytes(range(256)) * 8)
+    dict_file = tmp_path / "dict.tokdict"
+
+    res = _run("train-dict", str(dict_file), str(blob))
+    assert res.returncode == 0, res.stderr
+    assert "samples:         1" in res.stdout

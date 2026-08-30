@@ -29,27 +29,27 @@ def decompress(compressed_data: bytes, dictionary: TokDict | None = None) -> byt
     return TokPressCodec(dictionary=dictionary).decompress(compressed_data)
 
 
-def compress_file(input_path: str, output_path: str) -> None:
+def compress_file(input_path: str, output_path: str, dictionary: TokDict | None = None) -> None:
     with open(input_path, "rb") as f:
         data = f.read()
-    compressed = compress(data)
+    compressed = compress(data, dictionary=dictionary)
     with open(output_path, "wb") as f:
         f.write(compressed)
 
 
-def decompress_file(input_path: str, output_path: str) -> None:
+def decompress_file(input_path: str, output_path: str, dictionary: TokDict | None = None) -> None:
     with open(input_path, "rb") as f:
         data = f.read()
-    restored = decompress(data)
+    restored = decompress(data, dictionary=dictionary)
     with open(output_path, "wb") as f:
         f.write(restored)
 
 
-def benchmark(input_path: str) -> dict:
+def benchmark(input_path: str, dictionary: TokDict | None = None) -> dict:
     with open(input_path, "rb") as f:
         data = f.read()
 
-    codec = _get_codec()
+    codec = TokPressCodec(dictionary=dictionary) if dictionary is not None else _get_codec()
 
     t0 = time.perf_counter()
     compressed = codec.compress(data)
