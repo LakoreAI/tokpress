@@ -683,6 +683,47 @@ def run_batch_attribution(path: Path | None = None, split_frac: float = 0.8) -> 
     )
 
 
+def run_schema_regimes() -> None:
+    """Cross-schema trained-dictionary regimes (docs/TODO.md item 4): the
+    target-regime claims so far rest on one JSON-log schema. These runs apply
+    the same harness to three real, schema-different corpora so the claims
+    generalize past JSON logs:
+
+    - package_metadata.jsonl: real conda package-metadata SUMMARY records
+      (name/version/build/license/size/subdir/timestamp/channel), ~210B each --
+      the many-small-records shape.
+    - package_metadata_full.jsonl: the same packages' FULL conda metadata,
+      ~5.3KB median each (<=16KB) -- the medium-record / 1-2KB-plus crossover
+      zone where per-record adaptive models and the dictionary trade off.
+    - real_distinct_logs.json: API-telemetry-style records (HTTP method/path/
+      status/latency, client, session), ~28B each -- a second many-small schema
+      with a much higher entropy payload than JSON logs.
+
+    All corpora are real (see data/bench/README.md for provenance); the logs
+    run samples the first 500 records for a tractable runtime.
+    """
+    pm = REAL_DATA / "package_metadata.jsonl"
+    pm_full = REAL_DATA / "package_metadata_full.jsonl"
+    logs = REAL_DATA / "real_distinct_logs.json"
+
+    def _lines(path: Path, limit: int | None = None) -> list[bytes] | None:
+        if not path.is_file():
+            print(f"\n=== schema regime: SKIPPED (corpus not found at {path}) ===")
+            return None
+        lines = [line for line in path.read_bytes().split(b"\n") if line]
+        return lines[:limit] if limit else lines
+
+    lines = _lines(pm)
+    if lines is not None:
+        run_trained_dictionary_regime(lines, split_frac=0.8, label=" (package-metadata summary)")
+    lines = _lines(pm_full)
+    if lines is not None:
+        run_trained_dictionary_regime(lines, split_frac=0.8, label=" (package-metadata full records)")
+    lines = _lines(logs, limit=500)
+    if lines is not None:
+        run_trained_dictionary_regime(lines, split_frac=0.8, label=" (API-telemetry distinct logs)")
+
+
 def _code_snippet_records(min_size: int = 100, max_size: int = 2000) -> list[bytes]:
     path = REAL_DATA / "real_python_code.py"
     if not path.is_file():
@@ -836,6 +877,7 @@ def main() -> None:
 
     run_many_small_records()
     run_paper_scale_dictionary_regime()
+    run_schema_regimes()
     run_ablations()
     run_repeated_splits()
     run_batch_attribution()

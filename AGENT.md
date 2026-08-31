@@ -1,10 +1,6 @@
 # TokPress — Agent Guidelines
 
-TokPress is a pure-Python, tiktoken-tokenizer-driven, entropy-coded (rANS)
-lossless compression library and CLI. It tokenizes input with tiktoken's
-real `o200k_base` encoding (the same tokenizer OpenAI's models use), applies
-token-level LZ77, then picks whichever of two entropy/bitstream candidates
-is smaller.
+TokPress is a pure-Python, tiktoken-tokenizer-driven, entropy-coded (rANS) lossless compression library and CLI. It tokenizes input with tiktoken's real `o200k_base` encoding (the same tokenizer OpenAI's models use), applies token-level LZ77, then picks whichever of two entropy/bitstream candidates is smaller.
 
 ## Where things live
 
