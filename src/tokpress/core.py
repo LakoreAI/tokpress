@@ -49,10 +49,7 @@ def compress_many(
     dictionary: TokDict | None = None,
     tokenizer: TiktokenTokenizer | None = None,
 ) -> bytes:
-    """Compress many independent records as a single stream so the entropy model adapts *across* records instead of each record paying its own per-record header/table cost (the codec's chunked-adaptive mode builds its tables from cumulative history, and LZ history is shared across the whole batch). For the many-small-homogeneous-records regime this is dramatically smaller than compressing each record separately.
-
-    Wire format: 'TOKB' magic + version + n_records(u32 LE) + per-record byte length (LEB128 varint) + one single-record TokPress stream of the concatenated records. `decompress_many` returns the records byte-exact.
-    """
+    """Compress many independent records as a single stream so the entropy model adapts *across* records instead of each record paying its own per-record header/table cost (the codec's chunked-adaptive mode builds its tables from cumulative history, and LZ history is shared across the whole batch). For the many-small-homogeneous-records regime this is dramatically smaller than compressing each record separately. Wire format: 'TOKB' magic + version + n_records(u32 LE) + per-record byte length (LEB128 varint) + one single-record TokPress stream of the concatenated records. `decompress_many` returns the records byte-exact."""
     concat = b"".join(records)
     inner = compress(concat, dictionary=dictionary, tokenizer=tokenizer)
 

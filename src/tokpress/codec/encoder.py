@@ -64,7 +64,15 @@ class TokPressEncoder:
         w.write_byte(mode)
         w.write_uint32(n_raw)
 
-    def compress(self, raw_bytes: bytes) -> bytes:
+    def compress(self, raw_bytes: bytes, force_mode: int | None = None) -> bytes:
+        """Compress a record, keeping whichever candidate mode is smallest.
+
+        `force_mode` selects one specific mode's payload instead (used by the
+        component-ablation harness, scripts/bench.py's run_ablations, to
+        measure a candidate in isolation regardless of whether another mode
+        would win on size). No wire-format change: it just returns the bytes
+        one existing mode would have emitted.
+        """
         n_raw = len(raw_bytes)
         if n_raw == 0:
             w = BitWriter()
@@ -76,23 +84,35 @@ class TokPressEncoder:
         lz_tokens = self._lz.encode(tokens, [])
         bits_per_symbol = max(1, self.tokenizer.match_flag.bit_length())
 
-        candidates = [
-            self._encode_raw_tokens(lz_tokens, n_raw, bits_per_symbol),
-            self._encode_rans_sparse(lz_tokens, n_raw),
-            self._encode_rans_split(lz_tokens, n_raw),
-        ]
+        candidates: dict[int, bytes] = {
+            MODE_RAW_TOKENS: self._encode_raw_tokens(lz_tokens, n_raw, bits_per_symbol),
+            MODE_RANS_SPARSE: self._encode_rans_sparse(lz_tokens, n_raw),
+            MODE_RANS_SPLIT: self._encode_rans_split(lz_tokens, n_raw),
+            # Adaptive-split is ALWAYS built, even for very short records:
+            # its local (literal-only) alphabet makes it the winner on short
+            # schema-homogeneous records (measured: it beat the next-best mode
+            # on every record < 512 symbols in all three vendored corpora), so
+            # a length gate here would be a ratio regression, not a win.
+            MODE_RANS_ADAPTIVE_SPLIT: self._encode_rans_adaptive_split(lz_tokens, n_raw),
+        }
         if len(set(lz_tokens)) <= RANS_M and len(lz_tokens) >= ADAPTIVE_MIN_SYMBOLS:
-            candidates.append(self._encode_rans_adaptive(lz_tokens, n_raw))
-        candidates.append(self._encode_rans_adaptive_split(lz_tokens, n_raw))
+            # The pure adaptive and PPM modes only pay off once there is enough
+            # history to adapt from; below ADAPTIVE_MIN_SYMBOLS they collapse to
+            # a single static chunk and only add per-mode overhead.
+            candidates[MODE_RANS_ADAPTIVE] = self._encode_rans_adaptive(lz_tokens, n_raw)
         if len(set(lz_tokens)) < RANS_M and len(lz_tokens) >= ADAPTIVE_MIN_SYMBOLS:
-            candidates.append(self._encode_rans_ppm(lz_tokens, n_raw))
-            candidates.append(self._encode_rans_ppm_split(lz_tokens, n_raw))
+            candidates[MODE_RANS_PPM] = self._encode_rans_ppm(lz_tokens, n_raw)
+            candidates[MODE_RANS_PPM_SPLIT] = self._encode_rans_ppm_split(lz_tokens, n_raw)
 
         if self.dictionary is not None:
             dict_lz_tokens = self._lz.encode(tokens, self.dictionary.priming_tokens)
-            candidates.append(self._encode_rans_dict(dict_lz_tokens, n_raw))
+            candidates[MODE_RANS_DICT] = self._encode_rans_dict(dict_lz_tokens, n_raw)
 
-        return min(candidates, key=len)
+        if force_mode is not None:
+            if force_mode not in candidates:
+                raise ValueError(f"mode {force_mode} was not built for this record")
+            return candidates[force_mode]
+        return min(candidates.values(), key=len)
 
     def _encode_raw_tokens(self, lz_tokens: list[int], n_raw: int, bits_per_symbol: int) -> bytes:
         w = BitWriter()

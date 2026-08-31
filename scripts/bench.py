@@ -41,7 +41,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 # RFC 9842 dictionary compression over HTTP -- see docs/VISION.md §use-case.
 from tokpress import compress_many, decompress_many  # noqa: E402
 from tokpress.codec.decoder import TokPressDecoder  # noqa: E402
-from tokpress.codec.encoder import TokPressEncoder  # noqa: E402
+from tokpress.codec.encoder import MODE_RANS_DICT, TokPressEncoder  # noqa: E402
 from tokpress.dictionary import TokDict  # noqa: E402
 from tokpress.tokenizer import bpe_trainer  # noqa: E402
 from tokpress.tokenizer.tiktoken_adapter import TiktokenTokenizer  # noqa: E402
@@ -469,6 +469,127 @@ def run_paper_scale_dictionary_regime() -> None:
     run_trained_dictionary_regime(lines, split_frac=0.8, label=" (paper-scale, json_heldout.jsonl)")
 
 
+def run_ablations(path: Path | None = None, split_frac: float = 0.8) -> None:
+    """Component ablation of the trained-dictionary gain (docs/TODO.md item 1).
+    The headline per-record tokpress+dict ratio stacks several effects: the LZ
+    priming buffer, the baked order-0 table, and the order-1 context tables
+    (plus the adaptive escape share inside each table). This isolates each
+    layer's marginal contribution by forcing the MODE_RANS_DICT candidate
+    (so no other mode masks the dictionary's own size) for every dict variant.
+    """
+    path = path if path is not None else REAL_DATA / "json_heldout.jsonl"
+    if not path.is_file():
+        print(f"\n=== component ablation: SKIPPED (corpus not found at {path}) ===")
+        return
+    lines = [line for line in path.read_bytes().split(b"\n") if line]
+    split = int(len(lines) * split_frac)
+    train_records, test_records = lines[:split], lines[split:]
+    total_raw = sum(len(r) for r in test_records)
+
+    def _ratio(records: list[bytes], compress_fn) -> float:
+        return sum(len(compress_fn(r)) for r in records) / total_raw
+
+    def _dict_ratio(d: TokDict, force: bool = True) -> tuple[float, bool]:
+        enc = TokPressEncoder(dictionary=d)
+        dec = TokPressDecoder(dictionary=d)
+        total = 0
+        ok = True
+        for r in test_records:
+            c = enc.compress(r, force_mode=MODE_RANS_DICT) if force else enc.compress(r)
+            ok = ok and dec.decompress(c) == r
+            total += len(c)
+        return total / total_raw, ok
+
+    enc_plain = TokPressEncoder()
+    base_ratio = _ratio(test_records, enc_plain.compress)
+
+    order0 = TokDict.train(train_records, use_priming=False, use_contexts=False)
+    order0_ratio, ok0 = _dict_ratio(order0)
+    plus_priming = TokDict.train(train_records, use_priming=True, use_contexts=False)
+    priming_ratio, ok1 = _dict_ratio(plus_priming)
+    full = TokDict.train(train_records)
+    full_ratio, ok2 = _dict_ratio(full)
+    full_eff_ratio, ok3 = _dict_ratio(full, force=False)
+
+    print(
+        f"\n=== component ablation of the trained dictionary ({len(train_records)} train / "
+        f"{len(test_records)} held-out test records, {total_raw} test bytes) ==="
+    )
+    print(f"{'configuration':<42} {'ratio':>8} {'delta vs prev':>14} {'roundtrip':>10}")
+    rows = [
+        ("tokpress, per-record, no dictionary (effective)", base_ratio, None, True),
+        ("dict order-0 table only (no priming, no order-1)", order0_ratio, None, ok0),
+        ("+ LZ priming buffer", priming_ratio, order0_ratio, ok1),
+        ("+ order-1 context tables (full dict)", full_ratio, priming_ratio, ok2),
+        ("full dict, effective (min over all modes)", full_eff_ratio, full_ratio, ok3),
+    ]
+    for label, ratio, base, ok in rows:
+        if base is not None:
+            delta_s = f"{ratio - base:+.4f}"
+        else:
+            delta_s = ""
+        print(f"{label:<42} {ratio:>8.4f} {delta_s:>14} {'OK' if ok else 'FAIL'}")
+    print("  (delta vs prev: the marginal contribution of the layer just added)")
+    print("  (all dict rows are the MODE_RANS_DICT candidate in isolation, except the last)")
+
+
+def run_repeated_splits(path: Path | None = None, n_splits: int = 5, split_frac: float = 0.8, seed: int = 0) -> None:
+    """Repeated train/test splits with mean +- stdev (docs/TODO.md item 1).
+    The paper-scale claim currently rests on one 80/20 split; this reports the
+    spread of tokpress+dict / tokpress+dict+batch / zstd_19+dict over several
+    seeded shuffles instead of a single aggregate ratio."""
+    path = path if path is not None else REAL_DATA / "json_heldout.jsonl"
+    if not path.is_file():
+        print(f"\n=== repeated-split stats: SKIPPED (corpus not found at {path}) ===")
+        return
+    lines = [line for line in path.read_bytes().split(b"\n") if line]
+    rng = random.Random(seed)
+    series: dict[str, list[float]] = {"tokpress+dict": [], "tokpress+dict+batch": [], "zstd_19+dict": []}
+
+    for _ in range(n_splits):
+        shuffled = lines[:]
+        rng.shuffle(shuffled)
+        split = int(len(shuffled) * split_frac)
+        train_records, test_records = shuffled[:split], shuffled[split:]
+        total_raw = sum(len(r) for r in test_records)
+
+        tokdict = TokDict.train(train_records)
+        enc = TokPressEncoder(dictionary=tokdict)
+        series["tokpress+dict"].append(sum(len(enc.compress(r)) for r in test_records) / total_raw)
+
+        packed = compress_many(test_records, dictionary=tokdict)
+        series["tokpress+dict+batch"].append(len(packed) / total_raw)
+
+        if ZSTD_AVAILABLE:
+            zdict = _zstd_train_dict(train_records)
+            if zdict is not None:
+                with tempfile.NamedTemporaryFile(suffix=".dict") as f:
+                    f.write(zdict)
+                    f.flush()
+                    total = sum(
+                        len(
+                            subprocess.run(
+                                ["zstd", "-19", "-D", f.name, "-c"], input=r, capture_output=True, check=True
+                            ).stdout
+                        )
+                        for r in test_records
+                    )
+                series["zstd_19+dict"].append(total / total_raw)
+
+    print(
+        f"\n=== repeated-split stats ({n_splits} seeded shuffles, {split_frac:.0%}/"
+        f"{1 - split_frac:.0%} train/test, seed {seed}) ==="
+    )
+    print(f"{'method':<22} {'mean ratio':>12} {'stdev':>10} {'min':>10} {'max':>10} {'n':>4}")
+    for name, vals in series.items():
+        if not vals:
+            print(f"{name:<22} {'SKIPPED':>12}")
+            continue
+        mean = statistics.mean(vals)
+        sd = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        print(f"{name:<22} {mean:>12.4f} {sd:>10.4f} {min(vals):>10.4f} {max(vals):>10.4f} {len(vals):>4}")
+
+
 def _code_snippet_records(min_size: int = 100, max_size: int = 2000) -> list[bytes]:
     path = REAL_DATA / "real_python_code.py"
     if not path.is_file():
@@ -622,6 +743,8 @@ def main() -> None:
 
     run_many_small_records()
     run_paper_scale_dictionary_regime()
+    run_ablations()
+    run_repeated_splits()
     run_cross_schema_generalization()
     run_size_sweep()
 

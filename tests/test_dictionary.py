@@ -117,3 +117,67 @@ def test_decompress_with_wrong_dictionary_raises():
     dec = TokPressDecoder(dictionary=d2)
     with pytest.raises(ValueError):
         dec.decompress(compressed)
+
+
+def test_ablated_dict_no_priming_no_contexts():
+    """use_priming=False / use_contexts=False trains a valid dictionary that
+    deliberately omits both the LZ priming buffer and the order-1 context
+    tables (the ablation harness's 'baked order-0 only' layer). It must still
+    round-trip byte-exact on novel content via the escape cascade."""
+    d = TokDict.train(TRAIN_RECORDS, use_priming=False, use_contexts=False)
+    assert d.priming_tokens == []
+    assert d.context_stats == {}
+
+    enc = TokPressEncoder(dictionary=d)
+    dec = TokPressDecoder(dictionary=d)
+    for i in range(900, 940):
+        record = f'{{"user": "u{i}", "action": "click", "page": "/home", "ts": {1700000000 + i}}}'.encode()
+        assert dec.decompress(enc.compress(record)) == record
+
+
+def test_ablated_dict_priming_no_contexts():
+    d = TokDict.train(TRAIN_RECORDS, use_priming=True, use_contexts=False)
+    assert len(d.priming_tokens) > 0
+    assert d.context_stats == {}
+
+    enc = TokPressEncoder(dictionary=d)
+    dec = TokPressDecoder(dictionary=d)
+    for i in range(900, 940):
+        record = f'{{"user": "u{i}", "action": "click", "page": "/home", "ts": {1700000000 + i}}}'.encode()
+        assert dec.decompress(enc.compress(record)) == record
+
+
+def test_ablated_dicts_have_distinct_fingerprints():
+    """A stream compressed with an ablated dictionary must not decompress
+    against the full dictionary (they are genuinely different tables)."""
+    full = TokDict.train(TRAIN_RECORDS)
+    ablated = TokDict.train(TRAIN_RECORDS, use_priming=False, use_contexts=False)
+    assert full.fingerprint != ablated.fingerprint
+
+    enc = TokPressEncoder(dictionary=full)
+    compressed = _force_dict_encode(enc, b'{"user": "u999", "action": "click"}')
+    dec = TokPressDecoder(dictionary=ablated)
+    with pytest.raises(ValueError):
+        dec.decompress(compressed)
+
+
+def test_coverage_priming_is_deterministic_and_valid():
+    d1 = TokDict.train(TRAIN_RECORDS, priming_mode="coverage")
+    d2 = TokDict.train(TRAIN_RECORDS, priming_mode="coverage")
+    assert d1.priming_tokens == d2.priming_tokens
+    assert len(d1.priming_tokens) > 0
+
+    enc = TokPressEncoder(dictionary=d1)
+    dec = TokPressDecoder(dictionary=d1)
+    record = b'{"user": "u999", "action": "click", "page": "/home", "ts": 1700009999}'
+    assert dec.decompress(enc.compress(record)) == record
+
+
+def test_coverage_priming_obeys_budget():
+    d = TokDict.train(TRAIN_RECORDS, priming_mode="coverage", max_priming_tokens=50)
+    assert len(d.priming_tokens) <= 50
+
+
+def test_invalid_priming_mode_raises():
+    with pytest.raises(ValueError):
+        TokDict.train(TRAIN_RECORDS, priming_mode="bogus")

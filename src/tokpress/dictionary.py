@@ -10,6 +10,7 @@ Nothing here depends on a custom-trained tokenizer vocabulary; it trains directl
 """
 
 import hashlib
+import math
 import struct
 
 from .entropy.frequency import RANS_M, SymbolStats
@@ -64,7 +65,29 @@ class TokDict:
         samples: list[bytes],
         max_priming_tokens: int = 8192,
         tokenizer: TiktokenTokenizer | None = None,
+        use_priming: bool = True,
+        use_contexts: bool = True,
+        priming_mode: str = "concat",
     ) -> "TokDict":
+        """Train a TokDict on a sample of schema-homogeneous records.
+
+        `use_priming` / `use_contexts` are ablation switches: setting either to
+        False trains a dictionary that deliberately omits that component (empty
+        priming buffer / no order-1 context tables), so the marginal
+        contribution of each layer can be measured against the full dict on the
+        same data (scripts/bench.py's run_ablations). The resulting dictionary
+        is still a fully valid codec dictionary (the escape cascade covers the
+        missing layer), just with a different fingerprint than the full one --
+        streams compressed with an ablated dictionary will not decompress
+        against the full dictionary, as intended.
+
+        `priming_mode` selects how the LZ priming buffer is filled from the
+        training sample: "concat" (default) head-concatenates token streams in
+        sample order until `max_priming_tokens`; "coverage" greedily selects the
+        records carrying the most of the corpus's frequent-token mass first
+        (a simplified, token-level analogue of zstd's COVER sample selection) --
+        see _priming_tokens_coverage.
+        """
         if not samples:
             raise ValueError("TokDict.train needs at least one sample record")
 
@@ -79,12 +102,20 @@ class TokDict:
         escape_symbol = real_alphabet_size  # one slot past the real token range
         dict_alphabet_size = real_alphabet_size + 1
 
-        priming_tokens: list[int] = []
-        for sample in samples:
-            priming_tokens.extend(tokenizer.encode(sample))
-            if len(priming_tokens) >= max_priming_tokens:
-                break
-        priming_tokens = priming_tokens[:max_priming_tokens]
+        if priming_mode == "coverage":
+            priming_tokens = cls._priming_tokens_coverage(samples, tokenizer, max_priming_tokens)
+        elif priming_mode == "concat":
+            priming_tokens = []
+            for sample in samples:
+                priming_tokens.extend(tokenizer.encode(sample))
+                if len(priming_tokens) >= max_priming_tokens:
+                    break
+            priming_tokens = priming_tokens[:max_priming_tokens]
+        else:
+            raise ValueError(f"unknown priming_mode: {priming_mode!r} (expected 'concat' or 'coverage')")
+
+        if not use_priming:
+            priming_tokens = []
 
         raw_counts = [0] * dict_alphabet_size
         total = 0
@@ -96,36 +127,74 @@ class TokDict:
             for sym in lz_tokens:
                 raw_counts[sym] += 1
                 total += 1
-            for i in range(1, len(lz_tokens)):
-                ctx, nxt = lz_tokens[i - 1], lz_tokens[i]
-                bucket = context_pair_counts.setdefault(ctx, {})
-                bucket[nxt] = bucket.get(nxt, 0) + 1
-                context_totals[ctx] = context_totals.get(ctx, 0) + 1
+            if use_contexts:
+                for i in range(1, len(lz_tokens)):
+                    ctx, nxt = lz_tokens[i - 1], lz_tokens[i]
+                    bucket = context_pair_counts.setdefault(ctx, {})
+                    bucket[nxt] = bucket.get(nxt, 0) + 1
+                    context_totals[ctx] = context_totals.get(ctx, 0) + 1
 
         stats = cls._build_table(
             dict_alphabet_size, real_alphabet_size, escape_symbol, raw_counts, total, _ORDER0_ESCAPE_SHARE
         )
 
-        eligible = [ctx for ctx, n in context_totals.items() if n >= MIN_CONTEXT_TRANSITIONS]
-        eligible.sort(key=lambda ctx: context_totals[ctx], reverse=True)
         context_stats: dict[int, SymbolStats] = {}
-        for ctx in eligible[:MAX_CONTEXT_TABLES]:
-            ctx_raw_counts = [0] * dict_alphabet_size
-            ctx_total = 0
-            for sym, count in context_pair_counts[ctx].items():
-                ctx_raw_counts[sym] = count
-                ctx_total += count
-            context_stats[ctx] = cls._build_table(
-                dict_alphabet_size,
-                real_alphabet_size,
-                escape_symbol,
-                ctx_raw_counts,
-                ctx_total,
-                adaptive_escape=True,
-            )
+        if use_contexts:
+            eligible = [ctx for ctx, n in context_totals.items() if n >= MIN_CONTEXT_TRANSITIONS]
+            eligible.sort(key=lambda ctx: context_totals[ctx], reverse=True)
+            for ctx in eligible[:MAX_CONTEXT_TABLES]:
+                ctx_raw_counts = [0] * dict_alphabet_size
+                ctx_total = 0
+                for sym, count in context_pair_counts[ctx].items():
+                    ctx_raw_counts[sym] = count
+                    ctx_total += count
+                context_stats[ctx] = cls._build_table(
+                    dict_alphabet_size,
+                    real_alphabet_size,
+                    escape_symbol,
+                    ctx_raw_counts,
+                    ctx_total,
+                    adaptive_escape=True,
+                )
 
         fingerprint = cls._fingerprint(priming_tokens, raw_counts, context_stats)
         return cls(priming_tokens, stats, context_stats, fingerprint)
+
+    @staticmethod
+    def _priming_tokens_coverage(
+        samples: list[bytes], tokenizer: TiktokenTokenizer, max_priming_tokens: int
+    ) -> list[int]:
+        """Fill the priming buffer by coverage instead of by sample order.
+
+        Head-concatenation puts whatever records happen to be first into the
+        buffer; "coverage" instead scores every training record by how much of
+        the corpus's frequent-token mass it carries (sum over its distinct
+        tokens of log(1 + that token's corpus count), so records made of tokens
+        that recur across the corpus rank highest) and takes the highest-scoring
+        records first. The buffer stays contiguous token-stream material, so LZ77
+        can still match whole sequences, but the material is chosen for how
+        representative it is of the training distribution rather than by file
+        order. Deterministic: ties break by sample index."""
+        tokenized = [tokenizer.encode(s) for s in samples]
+        counts: dict[int, int] = {}
+        for toks in tokenized:
+            for t in set(toks):
+                counts[t] = counts.get(t, 0) + 1
+        scored = []
+        for idx, toks in enumerate(tokenized):
+            score = 0.0
+            for t in set(toks):
+                score += math.log1p(counts[t])
+            scored.append((score, idx))
+        scored.sort(reverse=True)
+
+        priming: list[int] = []
+        for _, idx in scored:
+            if len(priming) >= max_priming_tokens:
+                break
+            remaining = max_priming_tokens - len(priming)
+            priming.extend(tokenized[idx][:remaining])
+        return priming
 
     @staticmethod
     def _build_table(

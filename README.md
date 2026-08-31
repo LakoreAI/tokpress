@@ -190,11 +190,12 @@ pip install -e .
 pytest tests/
 ```
 
-The suite (93 tests) covers bitstream and rANS roundtrips (incl. the
+The suite (99 tests) covers bitstream and rANS roundtrips (incl. the
 single-symbol-alphabet edge case), token-level LZ77 roundtrip, the tiktoken
 adapter's byte-exact roundtrip on arbitrary binary input (including invalid
 UTF-8), full codec roundtrips across payload shapes, `TokDict`
-training/save/load/escape-cascade roundtrips, the batch mode
+training/save/load/escape-cascade roundtrips (incl. the ablation knobs and
+coverage priming), the batch mode
 (`compress_many`/`decompress_many`), the BPE trainer (merge-chain validity,
 determinism, tiktoken agreement, rank-file roundtrip), custom-vocab codec
 roundtrips, `tokenize_stats` invariants, and black-box package/CLI tests.
