@@ -590,6 +590,99 @@ def run_repeated_splits(path: Path | None = None, n_splits: int = 5, split_frac:
         print(f"{name:<22} {mean:>12.4f} {sd:>10.4f} {min(vals):>10.4f} {max(vals):>10.4f} {len(vals):>4}")
 
 
+def run_batch_attribution(path: Path | None = None, split_frac: float = 0.8) -> None:
+    """Attribute the batch-mode win (docs/TODO.md item 1): `compress_many` is a
+    single adaptive stream over all records, so its gain over per-record
+    compression mixes (a) shared cross-record LZ history, (b) cross-record
+    adaptive entropy tables, and (c) amortized framing (one header instead of N).
+    This ladder holds the entropy table fixed where possible to isolate each:
+
+      per-record, MODE_RANS_DICT forced  ->  batch forced DICT  ->  batch effective
+
+    The first step (same baked table, per-record LZ vs batch LZ) isolates the
+    shared-LZ-history plus header-amortization effect; the second step (forced
+    static baked table vs the min-over-modes pick, which is the adaptive model
+    over the batch) isolates the adaptive-entropy-model effect. The TOKB framing
+    bytes are measured directly and reported separately.
+    """
+    path = path if path is not None else REAL_DATA / "json_heldout.jsonl"
+    if not path.is_file():
+        print(f"\n=== batch-mode attribution: SKIPPED (corpus not found at {path}) ===")
+        return
+    lines = [line for line in path.read_bytes().split(b"\n") if line]
+    if len(lines) < 20:
+        print(f"\n=== batch-mode attribution: SKIPPED (only {len(lines)} records) ===")
+        return
+    split = int(len(lines) * split_frac)
+    train_records, test_records = lines[:split], lines[split:]
+    concat = b"".join(test_records)
+    total_raw = sum(len(r) for r in test_records)
+
+    tokdict = TokDict.train(train_records)
+    enc_dict = TokPressEncoder(dictionary=tokdict)
+    dec_dict = TokPressDecoder(dictionary=tokdict)
+    enc_plain = TokPressEncoder()
+
+    def _ratio(bytes_n: int) -> float:
+        return bytes_n / total_raw
+
+    # Framing: TOKB header bytes = compress_many minus its inner single-record
+    # stream (compress of the same concat with the same dict).
+    inner = enc_dict.compress(concat)
+    packed = compress_many(test_records, dictionary=tokdict)
+    tokb_header = len(packed) - len(inner)
+    tokz_header = 10  # TOKZ magic(4) + version(1) + mode(1) + size(u32)
+
+    # A: per-record dict forced -- shared baked table, per-record LZ, N headers.
+    total_a = 0
+    ok_a = True
+    for r in test_records:
+        c = enc_dict.compress(r, force_mode=MODE_RANS_DICT)
+        ok_a = ok_a and dec_dict.decompress(c) == r
+        total_a += len(c)
+
+    # B: batch forced DICT -- same baked table, batch LZ, 1 header + TOKB framing.
+    ok_b = ok_a and dec_dict.decompress(inner) == concat
+    total_b = len(inner) + tokb_header
+
+    # C: batch effective -- min over modes (the adaptive model over the batch).
+    ok_c = decompress_many(packed, dictionary=tokdict) == test_records
+    total_c = len(packed)
+
+    # Context rows: per-record effective with and without dict, and the batch
+    # WITHOUT a dict (the regime where the adaptive model itself is the mechanism).
+    total_per_dict = sum(len(enc_dict.compress(r)) for r in test_records)
+    total_per_plain = sum(len(enc_plain.compress(r)) for r in test_records)
+    packed_plain = compress_many(test_records)
+    total_batch_plain = len(packed_plain)
+    ok_batch_plain = decompress_many(packed_plain) == test_records
+
+    print(
+        f"\n=== batch-mode win attribution ({len(train_records)} train / "
+        f"{len(test_records)} held-out test records, {total_raw} test bytes, "
+        f"{len(test_records)} TOKZ headers each 10B, TOKB framing {tokb_header}B) ==="
+    )
+    print(f"{'stage':<44} {'bytes':>9} {'ratio':>8} {'delta':>10} {'roundtrip':>10}")
+    rows = [
+        ("per-record effective, no dict", total_per_plain, None, True),
+        ("batch effective, no dict (adaptive model over batch)", total_batch_plain, total_per_plain, ok_batch_plain),
+        ("per-record effective + dict (headline 0.2565)", total_per_dict, None, True),
+        ("per-record, DICT forced (N headers, per-record LZ)", total_a, None, ok_a),
+        ("batch, DICT forced (+ shared LZ history)", total_b, total_a, ok_b),
+        ("batch effective (+ adaptive model over batch)", total_c, total_b, ok_c),
+    ]
+    for label, nbytes, base, ok in rows:
+        delta = f"{(nbytes - base) / total_raw:+.4f}" if base is not None else ""
+        ok_s = "OK" if ok else "FAIL"
+        print(f"{label:<44} {nbytes:>9} {_ratio(nbytes):>8.4f} {delta:>10} {ok_s:>10}")
+    print("  (deltas: batch DICT vs per-record DICT = shared-LZ + header amortization;")
+    print("   batch effective vs batch DICT = the cross-record adaptive entropy model)")
+    print(
+        f"  (pure framing saved per-record vs batch: {(len(test_records) - 1) * tokz_header} "
+        f"bytes of TOKZ headers, minus the {tokb_header}-byte TOKB header)"
+    )
+
+
 def _code_snippet_records(min_size: int = 100, max_size: int = 2000) -> list[bytes]:
     path = REAL_DATA / "real_python_code.py"
     if not path.is_file():
@@ -745,6 +838,8 @@ def main() -> None:
     run_paper_scale_dictionary_regime()
     run_ablations()
     run_repeated_splits()
+    run_batch_attribution()
+    run_batch_attribution(REAL_DATA / "small_records.jsonl")
     run_cross_schema_generalization()
     run_size_sweep()
 
