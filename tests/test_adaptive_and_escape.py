@@ -1,6 +1,8 @@
 import random
 import string
 
+import pytest
+
 from tokpress.codec.decoder import TokPressDecoder
 from tokpress.codec.encoder import MODE_RANS_ADAPTIVE, MODE_RANS_SPARSE, TokPressEncoder
 from tokpress.entropy.rans import RANS_M
@@ -22,6 +24,7 @@ def _json_like_payload(n_records: int) -> bytes:
     return b"".join(records)
 
 
+@pytest.mark.slow
 def test_sparse_mode_escape_path_roundtrips():
     """A record with more than RANS_M distinct LZ-token values used to make
     MODE_RANS_SPARSE unusable entirely (silent fallback to flat
@@ -60,6 +63,7 @@ def test_adaptive_mode_roundtrips():
     assert dec.decompress(compressed) == payload
 
 
+@pytest.mark.slow
 def test_compress_roundtrips_on_highly_diverse_long_text():
     enc = TokPressEncoder()
     dec = TokPressDecoder()

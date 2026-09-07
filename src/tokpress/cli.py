@@ -12,9 +12,9 @@ from .tokenizer.tiktoken_adapter import TiktokenTokenizer
 BANNER = "TokPress -- pure-Python tiktoken-driven compression"
 
 HELP_TEXT = """Usage:
-  tokpress compress <input_path> [-o <output.tokz>] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
+  tokpress compress <input_path> [-o <output.tokz>] [--dict <dict.tokdict>] [--vocab <vocab.ranks>] [--integrity] [--fast]
   tokpress decompress <input.tokz> [-o <output_path>] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
-  tokpress pack <output.tokz> <record_path> [record_path ...] [--dict <dict.tokdict>] [--vocab <vocab.ranks>] [--indexed]
+  tokpress pack <output.tokz> <record_path> [record_path ...] [--dict <dict.tokdict>] [--vocab <vocab.ranks>] [--indexed] [--integrity]
   tokpress unpack <input.tokz> <out_dir> [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
   tokpress read <indexed.tokz> <index> [-o <output_path>] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
   tokpress bench <input_path>
@@ -33,6 +33,18 @@ Options:
   --vocab-size N          train-vocab: target vocabulary size (default 4096)
   --max-bytes N           train-vocab: cap the training corpus (sampled from
                           the start) to N bytes (default 262144)
+  --integrity             compress/pack: append a crc32 trailer so a corrupt
+                          stream or a wrong --dict/--vocab at decompress time
+                          raises instead of silently returning wrong bytes
+  --fast                  compress only: emit a single pre-chosen entropy
+                          candidate (adaptive-split) instead of the min-over-
+                          modes gate -- much less encoder work, a few percent
+                          worse ratio, and not usable with --dict
+
+Streams compressed with a custom --vocab always carry an 8-byte vocabulary
+fingerprint, so decompressing with the wrong vocab raises even without
+--integrity; --integrity extends that guarantee to corruption and to the
+default o200k_base vocabulary.
 
 pack/unpack: batch-compress many independent records as one stream (each
 <record_path> is one record), so the entropy model adapts across records --
@@ -81,22 +93,30 @@ def _parse_flags(args: list[str], start: int) -> dict:
         elif args[i] == "--indexed":
             flags["indexed"] = True
             i += 1
+        elif args[i] == "--integrity":
+            flags["integrity"] = True
+            i += 1
+        elif args[i] == "--fast":
+            flags["fast"] = True
+            i += 1
         else:
             i += 1
     return flags
 
 
-_FLAG_TOKENS = ("-o", "--output", "--dict", "--vocab", "--vocab-size", "--max-bytes", "--indexed")
+_FLAG_TOKENS = ("-o", "--output", "--dict", "--vocab", "--vocab-size", "--max-bytes")
+_VALUE_LESS_FLAGS = ("--indexed", "--integrity", "--fast")
 
 
 def _parse_positional(args: list[str], start: int) -> list[str]:
     """Return the positional (non-flag) tokens from args[start:], skipping
-    flag names and their value tokens. --indexed is a value-less flag."""
+    flag names and their value tokens. Value-less flags are skipped on their
+    own."""
     positional = []
     i = start
     while i < len(args):
         tok = args[i]
-        if tok == "--indexed":
+        if tok in _VALUE_LESS_FLAGS:
             i += 1
         elif tok in _FLAG_TOKENS and i + 1 < len(args):
             i += 2
@@ -126,12 +146,22 @@ def cmd_compress(args: list[str]) -> int:
     output_path = flags.get("output", input_path + ".tokz")
     dictionary = TokDict.load(flags["dict"]) if "dict" in flags else None
     tokenizer = _load_tokenizer(flags.get("vocab"))
+    if flags.get("fast") and dictionary is not None:
+        print("Error: --fast cannot be combined with --dict (it skips the dictionary mode)")
+        print_help()
+        return 1
 
     with open(input_path, "rb") as f:
         data = f.read()
 
     t0 = time.perf_counter()
-    compressed = core.compress(data, dictionary=dictionary, tokenizer=tokenizer)
+    compressed = core.compress(
+        data,
+        dictionary=dictionary,
+        tokenizer=tokenizer,
+        integrity=bool(flags.get("integrity")),
+        fast=bool(flags.get("fast")),
+    )
     elapsed = time.perf_counter() - t0
 
     with open(output_path, "wb") as f:
@@ -260,9 +290,13 @@ def cmd_pack(args: list[str]) -> int:
 
     t0 = time.perf_counter()
     if flags.get("indexed"):
-        compressed = core.indexed_compress(records, dictionary=dictionary, tokenizer=tokenizer)
+        compressed = core.indexed_compress(
+            records, dictionary=dictionary, tokenizer=tokenizer, integrity=bool(flags.get("integrity"))
+        )
     else:
-        compressed = core.compress_many(records, dictionary=dictionary, tokenizer=tokenizer)
+        compressed = core.compress_many(
+            records, dictionary=dictionary, tokenizer=tokenizer, integrity=bool(flags.get("integrity"))
+        )
     elapsed = time.perf_counter() - t0
 
     with open(output_path, "wb") as f:

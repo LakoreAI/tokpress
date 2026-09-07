@@ -4,8 +4,13 @@ Container: magic "TOKZ" (4B) + version(1B)=1 + mode(1B) + uncompressed_size(u32 
 
 Modes: MODE_RAW_TOKENS=0 (fixed-width bit-packed tokens), MODE_RANS_SPARSE=1 (per-record freq table + rANS), MODE_RAW_FALLBACK=2 (empty input only), MODE_RANS_DICT=3 (rANS against a pre-trained, out-of-band TokDict -- carries only an 8-byte fingerprint instead of a per-record freq table), MODE_RANS_ADAPTIVE=4 (chunked, cumulative-history rANS), MODE_RANS_SPLIT=5 (match metadata in its own tables), MODE_RANS_ADAPTIVE_SPLIT=6 (both split and adaptive), MODE_RANS_PPM=7 (per-record PPM-style order-1 with escape-to-order-0), MODE_RANS_PPM_SPLIT=8 (the same order-1 cascade applied to the literal sub-stream, with match metadata in its own tables).
 
-The raw-tokens candidate is always built; the rANS-adaptive candidate is only built when the record's distinct-symbol count fits within RANS_M (every active symbol needs frequency >= 1, so a record with more distinct symbols can never be rebalanced to sum to RANS_M; see entropy/frequency.py's count_symbols); the rANS-dict candidate only when a TokDict was supplied. All applicable candidates are built and the smallest is kept. Sparse-table modes transmit the active-symbol-id list as sorted delta + varint (see bitstream/varint.py), since o200k_base's ~200k-token alphabet makes a naive fixed-width encoding dominate a per-record table for any text with more than a few hundred distinct tokens.
+Mode byte flags (high bits; masked off with MODE_MODE_MASK before dispatch so old streams, whose byte is always <= 8, parse unchanged): MODE_FLAG_EXT=0x20 marks the extended layout of MODE_RANS_ADAPTIVE / MODE_RANS_PPM, which transmit an out-of-band escape list when the record's distinct-symbol count would exceed RANS_M-1 (the cap; the layout is otherwise byte-identical to the plain one); MODE_FLAG_IDENTITY=0x40 marks a trailing 8-byte vocabulary fingerprint (present whenever a non-default/custom tokenizer was used, so decompressing with the wrong --vocab raises instead of silently corrupting); MODE_FLAG_INTEGRITY=0x80 marks a trailing crc32 of the original input (opt-in via `integrity=True`).
+
+The raw-tokens candidate is always built; the rANS-adaptive and PPM candidates are only built when the record is long enough to adapt from (ADAPTIVE_MIN_SYMBOLS) and now escape-cap their active alphabet to RANS_M-1 symbols instead of being skipped entirely for high-vocabulary records (previously a record with more distinct symbols could never be rebalanced to sum to RANS_M -- see entropy/frequency.py's count_symbols); the rANS-dict candidate only when a TokDict was supplied. All applicable candidates are built and the smallest is kept. Sparse-table modes transmit the active-symbol-id list as sorted delta + varint (see bitstream/varint.py), since o200k_base's ~200k-token alphabet makes a naive fixed-width encoding dominate a per-record table for any text with more than a few hundred distinct tokens.
 """
+
+import struct
+import zlib
 
 from ..bitstream import BitWriter, write_symbol_list
 from ..dictionary import MIN_CONTEXT_TRANSITIONS, TokDict
@@ -25,6 +30,16 @@ MODE_RANS_SPLIT = 5
 MODE_RANS_ADAPTIVE_SPLIT = 6
 MODE_RANS_PPM = 7
 MODE_RANS_PPM_SPLIT = 8
+
+# High bits of the mode byte, masked off before dispatch (MODE_MODE_MASK) so
+# old streams (mode byte always in 0..8) parse identically. 0x20 marks the
+# extended adaptive/PPM layout (out-of-band escape list); 0x40 and 0x80 mark
+# trailing vocab-fingerprint and crc32 payloads respectively (see module
+# docstring). Bits are OR'd into the existing mode byte, never replacing it.
+MODE_FLAG_EXT = 0x20
+MODE_FLAG_IDENTITY = 0x40
+MODE_FLAG_INTEGRITY = 0x80
+MODE_MODE_MASK = 0x1F
 
 # Chunk size for MODE_RANS_ADAPTIVE: each chunk after the first is entropy-coded
 # against a table built purely from already-processed chunks (Laplace-smoothed),
@@ -64,7 +79,7 @@ class TokPressEncoder:
         w.write_byte(mode)
         w.write_uint32(n_raw)
 
-    def compress(self, raw_bytes: bytes, force_mode: int | None = None) -> bytes:
+    def compress(self, raw_bytes: bytes, force_mode: int | None = None, integrity: bool = False) -> bytes:
         """Compress a record, keeping whichever candidate mode is smallest.
 
         `force_mode` selects one specific mode's payload instead (used by the
@@ -72,6 +87,12 @@ class TokPressEncoder:
         measure a candidate in isolation regardless of whether another mode
         would win on size). No wire-format change: it just returns the bytes
         one existing mode would have emitted.
+
+        `integrity=True` appends a crc32 of the original input to the stream
+        (MODE_FLAG_INTEGRITY), so decompression detects any corruption -- a
+        flipped bit, a truncation, or a decode under the wrong dictionary or
+        vocabulary -- instead of returning silently-wrong bytes. Costs 4
+        bytes per stream; opt-in.
         """
         n_raw = len(raw_bytes)
         if n_raw == 0:
@@ -95,12 +116,14 @@ class TokPressEncoder:
             # a length gate here would be a ratio regression, not a win.
             MODE_RANS_ADAPTIVE_SPLIT: self._encode_rans_adaptive_split(lz_tokens, n_raw),
         }
-        if len(set(lz_tokens)) <= RANS_M and len(lz_tokens) >= ADAPTIVE_MIN_SYMBOLS:
+        if len(lz_tokens) >= ADAPTIVE_MIN_SYMBOLS:
             # The pure adaptive and PPM modes only pay off once there is enough
             # history to adapt from; below ADAPTIVE_MIN_SYMBOLS they collapse to
-            # a single static chunk and only add per-mode overhead.
+            # a single static chunk and only add per-mode overhead. No distinct-
+            # symbol cap is needed here: both modes escape-cap their alphabet to
+            # RANS_M-1 real symbols (see their docstrings), so a record with any
+            # vocabulary size stays structurally valid.
             candidates[MODE_RANS_ADAPTIVE] = self._encode_rans_adaptive(lz_tokens, n_raw)
-        if len(set(lz_tokens)) < RANS_M and len(lz_tokens) >= ADAPTIVE_MIN_SYMBOLS:
             candidates[MODE_RANS_PPM] = self._encode_rans_ppm(lz_tokens, n_raw)
             candidates[MODE_RANS_PPM_SPLIT] = self._encode_rans_ppm_split(lz_tokens, n_raw)
 
@@ -111,8 +134,24 @@ class TokPressEncoder:
         if force_mode is not None:
             if force_mode not in candidates:
                 raise ValueError(f"mode {force_mode} was not built for this record")
-            return candidates[force_mode]
-        return min(candidates.values(), key=len)
+            payload = candidates[force_mode]
+        else:
+            payload = min(candidates.values(), key=len)
+
+        # Flag bits + trailing payloads are applied to the winning stream only,
+        # after the mode byte has been written at offset 5 (header layout is
+        # fixed: magic(4) + version(1) + mode(1) + size(u32)), so the underlying
+        # candidates stay byte-identical and the min-gate is unaffected.
+        if integrity or self.tokenizer.wants_identity_stamp:
+            out = bytearray(payload)
+            if self.tokenizer.wants_identity_stamp:
+                out[5] |= MODE_FLAG_IDENTITY
+                out += self.tokenizer.vocab_fingerprint
+            if integrity:
+                out[5] |= MODE_FLAG_INTEGRITY
+                out += struct.pack("<I", zlib.crc32(raw_bytes) & 0xFFFFFFFF)
+            return bytes(out)
+        return payload
 
     def _encode_raw_tokens(self, lz_tokens: list[int], n_raw: int, bits_per_symbol: int) -> bytes:
         w = BitWriter()
@@ -406,13 +445,34 @@ class TokPressEncoder:
         return w.getvalue()
 
     def _encode_rans_adaptive(self, lz_tokens: list[int], n_raw: int) -> bytes:
-        """Chunked, cumulative-history rANS: the record's active-symbol-id list is transmitted once (no per-symbol frequency), and each chunk after the first is coded against a table built purely from a Laplace-smoothed count of every earlier chunk's symbols. The decoder derives the identical table from what it has already decoded, so no per-chunk table bytes are ever transmitted. Chunk c's table must depend only on chunks 0..c-1, which is why every chunk's table is snapshotted in a forward pass before encoding (rANS itself must encode in reverse)."""
-        active_indices = sorted(set(lz_tokens))
-        local_index = {sym: i for i, sym in enumerate(active_indices)}
-        k = len(active_indices)
-        n = len(lz_tokens)
-        chunk_size = _adaptive_chunk_size(n, k)
+        """Chunked, cumulative-history rANS: the record's active-symbol-id list is transmitted once (no per-symbol frequency), and each chunk after the first is coded against a table built purely from a Laplace-smoothed count of every earlier chunk's symbols. The decoder derives the identical table from what it has already decoded, so no per-chunk table bytes are ever transmitted. Chunk c's table must depend only on chunks 0..c-1, which is why every chunk's table is snapshotted in a forward pass before encoding (rANS itself must encode in reverse).
 
+        Records with more than RANS_M-1 distinct symbols (an ordinary possibility now that RANS_M is large only in the sense that real corpora stay under it -- see the sparse mode) escape-cap the transmitted alphabet to the RANS_M-1 most frequent symbols and route everything else through a reserved escape slot whose value is carried out-of-band (MODE_FLAG_EXT layout, and only then: without escapes the layout is byte-identical to the plain one). The escape slot's Laplace mass is counted like any other symbol, so its probability is never zero in any chunk table.
+        """
+        n = len(lz_tokens)
+        counts: dict[int, int] = {}
+        for sym in lz_tokens:
+            counts[sym] = counts.get(sym, 0) + 1
+        has_escape = len(counts) > RANS_M - 1
+        if has_escape:
+            active_indices = sorted(sorted(counts, key=lambda s: (-counts[s], s))[: RANS_M - 1])
+        else:
+            active_indices = sorted(counts)
+        local_index = {sym: i for i, sym in enumerate(active_indices)}
+        escape_local = len(active_indices)
+        k = escape_local + 1 if has_escape else escape_local
+
+        coded: list[int] = []
+        escapes: list[int] = []
+        for sym in lz_tokens:
+            li = local_index.get(sym)
+            if li is None:
+                coded.append(escape_local)
+                escapes.append(sym)
+            else:
+                coded.append(li)
+
+        chunk_size = _adaptive_chunk_size(n, k)
         cum_counts = [1] * k
         cum_total = k
         chunk_bounds = list(range(0, n, chunk_size)) + [n]
@@ -422,8 +482,7 @@ class TokPressEncoder:
             stats = SymbolStats(k)
             stats.normalize(cum_counts, cum_total, build_decode_lut=False)
             chunk_stats.append(stats)
-            for sym in lz_tokens[chunk_bounds[c] : chunk_bounds[c + 1]]:
-                li = local_index[sym]
+            for li in coded[chunk_bounds[c] : chunk_bounds[c + 1]]:
                 cum_counts[li] += 1
                 cum_total += 1
 
@@ -432,13 +491,18 @@ class TokPressEncoder:
         for c in range(len(chunk_bounds) - 2, -1, -1):
             stats = chunk_stats[c]
             for i in range(chunk_bounds[c + 1] - 1, chunk_bounds[c] - 1, -1):
-                enc.encode_symbol(local_index[lz_tokens[i]], stats, words)
+                enc.encode_symbol(coded[i], stats, words)
 
+        mode = MODE_RANS_ADAPTIVE | (MODE_FLAG_EXT if has_escape else 0)
         w = BitWriter()
-        self._write_header(w, MODE_RANS_ADAPTIVE, n_raw)
+        self._write_header(w, mode, n_raw)
         w.write_uint32(n)
         w.write_uint32(chunk_size)
         write_symbol_list(w, active_indices)
+        if has_escape:
+            w.write_uint32(len(escapes))
+            for sym in escapes:
+                w.write_uint32(sym)
         w.write_uint64(enc.state)
         w.write_uint32(len(words))
         for word in words:
@@ -447,14 +511,25 @@ class TokPressEncoder:
         return w.getvalue()
 
     def _encode_rans_ppm(self, lz_tokens: list[int], n_raw: int) -> bytes:
-        """Per-record PPM-style adaptive order-1 rANS with escape-to-order-0. The order-0 table is Laplace-smoothed over the record's active symbols and always covers every symbol; per-context tables are derived cumulatively from the symbols that followed each previous token, with a PPMC-style count-based escape share (escape mass = number of distinct next-symbols seen in that context), so a low-support context mostly falls through to order-0 and never hurts. Encoding tries the previous token's context table first; an escape from it falls through to the order-0 table. No table is ever transmitted -- both sides derive the identical tables from decoded history, and only contexts with enough cumulative support (MIN_CONTEXT_TRANSITIONS) get a table at all."""
-        active_indices = sorted(set(lz_tokens))
-        local_index = {sym: i for i, sym in enumerate(active_indices)}
-        k = len(active_indices)
-        n = len(lz_tokens)
-        chunk_size = _adaptive_chunk_size(n, k)
+        """Per-record PPM-style adaptive order-1 rANS with escape-to-order-0. The order-0 table is Laplace-smoothed over the record's active symbols and always covers every symbol; per-context tables are derived cumulatively from the symbols that followed each previous token, with a PPMC-style count-based escape share (escape mass = number of distinct next-symbols seen in that context), so a low-support context mostly falls through to order-0 and never hurts. Encoding tries the previous token's context table first; an escape from it falls through to the order-0 table. No table is ever transmitted -- both sides derive the identical tables from decoded history, and only contexts with enough cumulative support (MIN_CONTEXT_TRANSITIONS) get a table at all.
 
-        order_counts = [1] * k
+        A record whose distinct-symbol count would exceed RANS_M-1 escapes-caps the active alphabet to the RANS_M-1 most frequent symbols (MODE_FLAG_EXT layout; byte-identical to the plain one otherwise): symbols beyond the cap are routed through an order-0 escape slot (Laplace-initiated at 1 like every other slot) and their real values travel out-of-band. Dropped symbols never enter the count tables, so both sides still derive identical tables; only the escape slot's own mass grows with each fall-through.
+        """
+        n = len(lz_tokens)
+        counts: dict[int, int] = {}
+        for sym in lz_tokens:
+            counts[sym] = counts.get(sym, 0) + 1
+        has_escape = len(counts) > RANS_M - 1
+        if has_escape:
+            active_indices = sorted(sorted(counts, key=lambda s: (-counts[s], s))[: RANS_M - 1])
+        else:
+            active_indices = sorted(counts)
+        local_index = {sym: i for i, sym in enumerate(active_indices)}
+        order0_escape = len(active_indices)  # ctx-escape and order0-escape share this index
+        n_escape_slots = order0_escape + 1 if has_escape else order0_escape
+        chunk_size = _adaptive_chunk_size(n, n_escape_slots)
+
+        order_counts = [1] * n_escape_slots
         ctx_counts: dict[int, dict[int, int]] = {}
         ctx_totals: dict[int, int] = {}
         chunk_bounds = list(range(0, n, chunk_size)) + [n]
@@ -462,24 +537,26 @@ class TokPressEncoder:
         chunk_order_stats: list[SymbolStats] = []
         chunk_ctx_tables: list[dict[int, SymbolStats]] = []
         for c in range(len(chunk_bounds) - 1):
-            order0_stats = SymbolStats(k)
+            order0_stats = SymbolStats(n_escape_slots)
             order0_stats.normalize(order_counts, sum(order_counts), build_decode_lut=False)
             chunk_order_stats.append(order0_stats)
             ctx_tables: dict[int, SymbolStats] = {}
-            for ctx, counts in ctx_counts.items():
+            for ctx, counts_here in ctx_counts.items():
                 if ctx_totals[ctx] < MIN_CONTEXT_TRANSITIONS:
                     continue
-                distinct = len(counts)
-                raw = [0] * (k + 1)
-                for local, cnt in counts.items():
+                distinct = len(counts_here)
+                raw = [0] * (order0_escape + 1)
+                for local, cnt in counts_here.items():
                     raw[local] = cnt
-                raw[k] = max(1, distinct)  # PPMC-style count-based escape mass
-                st = SymbolStats(k + 1)
-                st.normalize(raw, ctx_totals[ctx] + raw[k], build_decode_lut=False)
+                raw[order0_escape] = max(1, distinct)  # PPMC-style count-based escape mass
+                st = SymbolStats(order0_escape + 1)
+                st.normalize(raw, ctx_totals[ctx] + raw[order0_escape], build_decode_lut=False)
                 ctx_tables[ctx] = st
             chunk_ctx_tables.append(ctx_tables)
             for j in range(chunk_bounds[c], chunk_bounds[c + 1]):
-                local = local_index[lz_tokens[j]]
+                local = local_index.get(lz_tokens[j])
+                if local is None:
+                    continue  # dropped symbol: never enters the count tables
                 order_counts[local] += 1
                 if j > 0:
                     prev = lz_tokens[j - 1]
@@ -491,25 +568,37 @@ class TokPressEncoder:
         # order is context-first then order-0, so the encode calls run order-0
         # first then the context escape (same lesson as _encode_rans_dict).
         words: list[int] = []
+        escapes: list[int] = []
         enc = RansEncoder()
         for c in range(len(chunk_bounds) - 2, -1, -1):
             order0_stats = chunk_order_stats[c]
             ctx_tables = chunk_ctx_tables[c]
             for j in range(chunk_bounds[c + 1] - 1, chunk_bounds[c] - 1, -1):
-                local = local_index[lz_tokens[j]]
+                sym = lz_tokens[j]
+                local = local_index.get(sym)
                 ctx = ctx_tables.get(lz_tokens[j - 1]) if j > 0 else None
-                if ctx is not None and ctx.freq[local] > 0:
+                if ctx is not None and local is not None and ctx.freq[local] > 0:
                     enc.encode_symbol(local, ctx, words)
                 else:
-                    enc.encode_symbol(local, order0_stats, words)
+                    if local is None:
+                        enc.encode_symbol(order0_escape, order0_stats, words)
+                        escapes.append(sym)
+                    else:
+                        enc.encode_symbol(local, order0_stats, words)
                     if ctx is not None:
-                        enc.encode_symbol(k, ctx, words)  # context escape slot
+                        enc.encode_symbol(order0_escape, ctx, words)  # context escape slot
+        escapes.reverse()
 
+        mode = MODE_RANS_PPM | (MODE_FLAG_EXT if has_escape else 0)
         w = BitWriter()
-        self._write_header(w, MODE_RANS_PPM, n_raw)
+        self._write_header(w, mode, n_raw)
         w.write_uint32(n)
         w.write_uint32(chunk_size)
         write_symbol_list(w, active_indices)
+        if has_escape:
+            w.write_uint32(len(escapes))
+            for sym in escapes:
+                w.write_uint32(sym)
         w.write_uint64(enc.state)
         w.write_uint32(len(words))
         for word in words:
@@ -647,7 +736,13 @@ class TokPressEncoder:
                         enc.encode_symbol(k, ctx, words)  # ctx escape slot
                 enc.encode_symbol(0, role_stats, words)
                 lit_idx -= 1
-        escapes.reverse()
+        # `escapes` was built in the forward pass above (while constructing
+        # coded_literals), so it is already in the order the decoder consumes
+        # it -- it must NOT be reversed here (the same trap as
+        # _encode_rans_adaptive_split; reversing a forward-built list corrupts
+        # every stream with more than one literal escape, which needs
+        # > RANS_M-2 distinct literals and was therefore latent until the
+        # escape-capped alphabets of this revision made it reachable).
 
         w = BitWriter()
         self._write_header(w, MODE_RANS_PPM_SPLIT, n_raw)

@@ -1,11 +1,17 @@
 """Decoder: exact mirror of encoder.py's wire format."""
 
+import zlib
+
 from ..bitstream import BitReader, read_symbol_list
 from ..dictionary import MIN_CONTEXT_TRANSITIONS, TokDict
 from ..entropy.frequency import SymbolStats
 from ..entropy.rans import RANS_M_BITS, RansDecoder
 from ..tokenizer.tiktoken_adapter import TiktokenTokenizer
 from .encoder import (
+    MODE_FLAG_EXT,
+    MODE_FLAG_IDENTITY,
+    MODE_FLAG_INTEGRITY,
+    MODE_MODE_MASK,
     MODE_RANS_ADAPTIVE,
     MODE_RANS_ADAPTIVE_SPLIT,
     MODE_RANS_DICT,
@@ -42,7 +48,9 @@ class TokPressDecoder:
             raise ValueError("invalid TokPress stream: bad magic bytes")
 
         _version = r.read_byte()
-        mode = r.read_byte()
+        header_mode = r.read_byte()
+        header_flags = header_mode & ~MODE_MODE_MASK
+        mode = header_mode & MODE_MODE_MASK
         uncompressed_size = r.read_uint32()
 
         if uncompressed_size == 0 or mode == MODE_RAW_FALLBACK:
@@ -85,7 +93,12 @@ class TokPressDecoder:
         elif mode == MODE_RANS_ADAPTIVE:
             chunk_size = r.read_uint32()
             active_indices = read_symbol_list(r)
-            k = len(active_indices)
+            ext = bool(header_flags & MODE_FLAG_EXT)
+            if ext:
+                num_escapes = r.read_uint32()
+                escapes = [r.read_uint32() for _ in range(num_escapes)]
+            k = len(active_indices) + (1 if ext else 0)
+            escape_local = len(active_indices)
 
             rans_state = r.read_uint64()
             num_words = r.read_uint32()
@@ -95,6 +108,7 @@ class TokPressDecoder:
             cum_counts = [1] * k
             cum_total = k
             lz_tokens = []
+            escape_pos = 0
             pos = 0
             while pos < num_lz_tokens:
                 end = min(pos + chunk_size, num_lz_tokens)
@@ -102,7 +116,11 @@ class TokPressDecoder:
                 stats.normalize(cum_counts, cum_total, build_decode_lut=True)
                 for _ in range(pos, end):
                     local_sym = dec.decode_symbol(stats)
-                    sym = active_indices[local_sym]
+                    if ext and local_sym == escape_local:
+                        sym = escapes[escape_pos]
+                        escape_pos += 1
+                    else:
+                        sym = active_indices[local_sym]
                     lz_tokens.append(sym)
                     cum_counts[local_sym] += 1
                     cum_total += 1
@@ -112,43 +130,53 @@ class TokPressDecoder:
         elif mode == MODE_RANS_PPM:
             chunk_size = r.read_uint32()
             active_indices = read_symbol_list(r)
-            k = len(active_indices)
+            ext = bool(header_flags & MODE_FLAG_EXT)
+            if ext:
+                num_escapes = r.read_uint32()
+                escapes = [r.read_uint32() for _ in range(num_escapes)]
+            escape_slot = len(active_indices)  # ctx-escape and order0-escape share this index
+            n_slots = escape_slot + (1 if ext else 0)
 
             rans_state = r.read_uint64()
             num_words = r.read_uint32()
             words = [r.read_uint16() for _ in range(num_words)]
             dec = RansDecoder(rans_state, words)
 
-            order_counts = [1] * k
+            order_counts = [1] * n_slots
             ctx_counts: dict[int, dict[int, int]] = {}
             ctx_totals: dict[int, int] = {}
             lz_tokens = []
+            escape_pos = 0
             pos = 0
             while pos < num_lz_tokens:
                 end = min(pos + chunk_size, num_lz_tokens)
-                order0_stats = SymbolStats(k)
+                order0_stats = SymbolStats(n_slots)
                 order0_stats.normalize(order_counts, sum(order_counts), build_decode_lut=True)
                 ctx_tables = {}
                 for ctx, counts in ctx_counts.items():
                     if ctx_totals[ctx] < MIN_CONTEXT_TRANSITIONS:
                         continue
                     distinct = len(counts)
-                    raw = [0] * (k + 1)
+                    raw = [0] * (escape_slot + 1)
                     for local, cnt in counts.items():
                         raw[local] = cnt
-                    raw[k] = max(1, distinct)
-                    st = SymbolStats(k + 1)
-                    st.normalize(raw, ctx_totals[ctx] + raw[k], build_decode_lut=True)
+                    raw[escape_slot] = max(1, distinct)
+                    st = SymbolStats(escape_slot + 1)
+                    st.normalize(raw, ctx_totals[ctx] + raw[escape_slot], build_decode_lut=True)
                     ctx_tables[ctx] = st
                 for _ in range(pos, end):
                     prev = lz_tokens[-1] if lz_tokens else None
                     ctx = ctx_tables.get(prev) if prev is not None else None
                     if ctx is not None:
                         local = dec.decode_symbol(ctx)
-                        if local == k:  # context escape -> order-0
+                        if local == escape_slot:  # context escape -> order-0
                             local = dec.decode_symbol(order0_stats)
                     else:
                         local = dec.decode_symbol(order0_stats)
+                    if ext and local == escape_slot:  # order-0 escape -> out-of-band
+                        lz_tokens.append(escapes[escape_pos])
+                        escape_pos += 1
+                        continue
                     sym = active_indices[local]
                     lz_tokens.append(sym)
                     order_counts[local] += 1
@@ -381,4 +409,26 @@ class TokPressDecoder:
             raise ValueError(f"unknown TokPress mode byte: {mode}")
 
         tokens = self._lz.decode(lz_tokens, priming)
-        return self.tokenizer.decode(tokens)
+        plain = self.tokenizer.decode(tokens)
+
+        # Trailing metadata (encoder appends it only when the matching flag bit
+        # is set, and always after a byte-aligned payload -- skip any pad bits
+        # first, since e.g. MODE_RAW_TOKENS is not byte-aligned).
+        if header_flags & (MODE_FLAG_IDENTITY | MODE_FLAG_INTEGRITY):
+            r.align_to_byte()
+        if header_flags & MODE_FLAG_IDENTITY:
+            stamp = bytes(r.read_byte() for _ in range(8))
+            if stamp != self.tokenizer.vocab_fingerprint:
+                raise ValueError(
+                    "TokPress stream was compressed with a different vocabulary than "
+                    "the one supplied to this decoder -- pass the same --vocab/rank file "
+                    "that was used at compress time"
+                )
+        if header_flags & MODE_FLAG_INTEGRITY:
+            expected = r.read_uint32()
+            if expected != (zlib.crc32(plain) & 0xFFFFFFFF):
+                raise ValueError(
+                    "TokPress integrity check failed: the stream is corrupt, truncated, "
+                    "or was decoded under the wrong dictionary/vocabulary"
+                )
+        return plain

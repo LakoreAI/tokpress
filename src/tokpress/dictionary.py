@@ -86,7 +86,11 @@ class TokDict:
         sample order until `max_priming_tokens`; "coverage" greedily selects the
         records carrying the most of the corpus's frequent-token mass first
         (a simplified, token-level analogue of zstd's COVER sample selection) --
-        see _priming_tokens_coverage.
+        see _priming_tokens_coverage; "diverse" is the COVER-style increment
+        over that: it re-scans at every pick and takes the record adding the
+        most *new* frequent-token mass (a record whose tokens are already
+        covered gains almost nothing), trading representativeness for
+        diversity -- see _priming_tokens_diverse.
         """
         if not samples:
             raise ValueError("TokDict.train needs at least one sample record")
@@ -104,6 +108,8 @@ class TokDict:
 
         if priming_mode == "coverage":
             priming_tokens = cls._priming_tokens_coverage(samples, tokenizer, max_priming_tokens)
+        elif priming_mode == "diverse":
+            priming_tokens = cls._priming_tokens_diverse(samples, tokenizer, max_priming_tokens)
         elif priming_mode == "concat":
             priming_tokens = []
             for sample in samples:
@@ -112,7 +118,7 @@ class TokDict:
                     break
             priming_tokens = priming_tokens[:max_priming_tokens]
         else:
-            raise ValueError(f"unknown priming_mode: {priming_mode!r} (expected 'concat' or 'coverage')")
+            raise ValueError(f"unknown priming_mode: {priming_mode!r} (expected 'concat', 'coverage', or 'diverse')")
 
         if not use_priming:
             priming_tokens = []
@@ -194,6 +200,51 @@ class TokDict:
                 break
             remaining = max_priming_tokens - len(priming)
             priming.extend(tokenized[idx][:remaining])
+        return priming
+
+    @staticmethod
+    def _priming_tokens_diverse(
+        samples: list[bytes], tokenizer: TiktokenTokenizer, max_priming_tokens: int
+    ) -> list[int]:
+        """The COVER-style increment over _priming_tokens_coverage: instead of
+        scoring every record once and taking the top-N, re-scan the remaining
+        records at every pick and take the one that adds the most *new*
+        frequent-token mass (sum over its distinct tokens not yet covered of
+        log(1 + that token's corpus count)). Once a corpus-frequent token is in
+        the buffer, records that mostly repeat it stop winning, so later picks
+        are forced toward material the buffer does not already hold -- the
+        diversity axis head-concatenation and plain coverage both lack.
+        Deterministic: a token counts as covered once its record has been
+        picked, and ties break by sample index."""
+        tokenized = [tokenizer.encode(s) for s in samples]
+        counts: dict[int, int] = {}
+        for toks in tokenized:
+            for t in set(toks):
+                counts[t] = counts.get(t, 0) + 1
+        distinct_sets = [set(toks) for toks in tokenized]
+
+        remaining = list(range(len(tokenized)))
+        chosen: list[list[int]] = []
+        covered: set[int] = set()
+        while remaining and sum(len(t) for t in chosen) < max_priming_tokens:
+            best_gain = -1.0
+            best_idx: int | None = None
+            for idx in remaining:
+                gain = sum(math.log1p(counts[t]) for t in distinct_sets[idx] if t not in covered)
+                if gain > best_gain:
+                    best_gain = gain
+                    best_idx = idx
+            if best_idx is None or best_gain <= 0.0:
+                break  # nothing left adds uncovered frequent-token mass
+            remaining.remove(best_idx)
+            chosen.append(tokenized[best_idx])
+            covered.update(distinct_sets[best_idx])
+
+        priming: list[int] = []
+        for toks in chosen:
+            if len(priming) >= max_priming_tokens:
+                break
+            priming.extend(toks[: max_priming_tokens - len(priming)])
         return priming
 
     @staticmethod

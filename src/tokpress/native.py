@@ -15,8 +15,8 @@ class TokPressCodec:
         self.encoder = TokPressEncoder(dictionary=dictionary, tokenizer=tokenizer)
         self.decoder = TokPressDecoder(dictionary=dictionary, tokenizer=tokenizer)
 
-    def compress(self, data: bytes) -> bytes:
-        return self.encoder.compress(data)
+    def compress(self, data: bytes, integrity: bool = False) -> bytes:
+        return self.encoder.compress(data, integrity=integrity)
 
     def decompress(self, data: bytes) -> bytes:
         return self.decoder.decompress(data)

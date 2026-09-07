@@ -30,10 +30,28 @@ def _get_codec() -> TokPressCodec:
     return _codec
 
 
-def compress(data: bytes | str, dictionary: TokDict | None = None, tokenizer: TiktokenTokenizer | None = None) -> bytes:
+def compress(
+    data: bytes | str,
+    dictionary: TokDict | None = None,
+    tokenizer: TiktokenTokenizer | None = None,
+    integrity: bool = False,
+    fast: bool = False,
+) -> bytes:
+    """Compress a single record. `integrity=True` appends a crc32 trailer so
+    decompression detects corruption or a wrong vocabulary/dictionary instead
+    of silently returning wrong bytes (+4 bytes/stream). `fast=True` skips the
+    min-gate and emits a single pre-chosen entropy candidate (adaptive-split),
+    trading a few percent of ratio for a large cut in encoder work -- only
+    meaningful without a dictionary, and refused if one is supplied."""
     if isinstance(data, str):
         data = data.encode("utf-8")
-    return _codec_for(dictionary, tokenizer).compress(data)
+    if fast and dictionary is not None:
+        raise ValueError("fast=True skips the dictionary mode; it cannot be combined with a TokDict")
+    if fast and data:
+        from .codec.encoder import MODE_RANS_ADAPTIVE_SPLIT
+
+        return _codec_for(dictionary, tokenizer).encoder.compress(data, force_mode=MODE_RANS_ADAPTIVE_SPLIT)
+    return _codec_for(dictionary, tokenizer).compress(data, integrity=integrity)
 
 
 def decompress(
@@ -48,10 +66,11 @@ def compress_many(
     records: list[bytes],
     dictionary: TokDict | None = None,
     tokenizer: TiktokenTokenizer | None = None,
+    integrity: bool = False,
 ) -> bytes:
-    """Compress many independent records as a single stream so the entropy model adapts *across* records instead of each record paying its own per-record header/table cost (the codec's chunked-adaptive mode builds its tables from cumulative history, and LZ history is shared across the whole batch). For the many-small-homogeneous-records regime this is dramatically smaller than compressing each record separately. Wire format: 'TOKB' magic + version + n_records(u32 LE) + per-record byte length (LEB128 varint) + one single-record TokPress stream of the concatenated records. `decompress_many` returns the records byte-exact."""
+    """Compress many independent records as a single stream so the entropy model adapts *across* records instead of each record paying its own per-record header/table cost (the codec's chunked-adaptive mode builds its tables from cumulative history, and LZ history is shared across the whole batch). For the many-small-homogeneous-records regime this is dramatically smaller than compressing each record separately. Wire format: 'TOKB' magic + version + n_records(u32 LE) + per-record byte length (LEB128 varint) + one single-record TokPress stream of the concatenated records. `decompress_many` returns the records byte-exact. `integrity=True` appends a crc32 to the inner stream."""
     concat = b"".join(records)
-    inner = compress(concat, dictionary=dictionary, tokenizer=tokenizer)
+    inner = compress(concat, dictionary=dictionary, tokenizer=tokenizer, integrity=integrity)
 
     w = BitWriter()
     for b in _BATCH_MAGIC:
@@ -107,10 +126,16 @@ def decompress_many(
     return records
 
 
-def compress_file(input_path: str, output_path: str, dictionary: TokDict | None = None) -> None:
+def compress_file(
+    input_path: str,
+    output_path: str,
+    dictionary: TokDict | None = None,
+    tokenizer: TiktokenTokenizer | None = None,
+    integrity: bool = False,
+) -> None:
     with open(input_path, "rb") as f:
         data = f.read()
-    compressed = compress(data, dictionary=dictionary)
+    compressed = compress(data, dictionary=dictionary, tokenizer=tokenizer, integrity=integrity)
     with open(output_path, "wb") as f:
         f.write(compressed)
 
@@ -219,13 +244,15 @@ class IndexedBatchWriter:
         self,
         dictionary: TokDict | None = None,
         tokenizer: TiktokenTokenizer | None = None,
+        integrity: bool = False,
     ) -> None:
         self._codec = TokPressCodec(dictionary=dictionary, tokenizer=tokenizer)
+        self._integrity = integrity
         self._compressed: list[bytes] = []
         self._body_size = 0
 
     def add(self, record: bytes) -> None:
-        c = self._codec.compress(record)
+        c = self._codec.compress(record, integrity=self._integrity)
         self._compressed.append(c)
         self._body_size += len(c)
 
@@ -252,9 +279,10 @@ def indexed_compress(
     records: list[bytes],
     dictionary: TokDict | None = None,
     tokenizer: TiktokenTokenizer | None = None,
+    integrity: bool = False,
 ) -> bytes:
     """Compress many records as a TOKBI indexed batch: each record is a self-contained stream with a byte offset in the header, so any record can be decoded on its own. Unlike compress_many (one adaptive stream over the whole batch, best ratio), this trades a little per-record framing cost for random access and streaming."""
-    w = IndexedBatchWriter(dictionary=dictionary, tokenizer=tokenizer)
+    w = IndexedBatchWriter(dictionary=dictionary, tokenizer=tokenizer, integrity=integrity)
     w.add_many(records)
     return w.finish()
 

@@ -1,5 +1,7 @@
 import os
 
+import pytest
+
 import tokpress
 
 
@@ -33,6 +35,7 @@ def test_edge_multibyte_cjk_emojis():
     assert tokpress.decompress(compressed) == text
 
 
+@pytest.mark.slow
 def test_edge_random_high_entropy():
     random_bytes = os.urandom(64 * 1024)
     compressed = tokpress.compress(random_bytes)

@@ -45,6 +45,7 @@ def test_codec_roundtrip(data):
     assert dec.decompress(compressed) == data
 
 
+@pytest.mark.slow
 def test_random_high_entropy_roundtrip():
     data = os.urandom(64 * 1024)
     enc = TokPressEncoder()

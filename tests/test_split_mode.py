@@ -2,6 +2,8 @@ import os
 import random
 import string
 
+import pytest
+
 from tokpress.codec.decoder import TokPressDecoder
 from tokpress.codec.encoder import MODE_RANS_ADAPTIVE_SPLIT, MODE_RANS_SPLIT, TokPressEncoder
 from tokpress.entropy.frequency import SymbolStats
@@ -41,6 +43,7 @@ def test_single_symbol_table_freq_equals_rans_m_roundtrips():
     assert dec.decompress(compressed) == payload
 
 
+@pytest.mark.slow
 def test_split_mode_roundtrips_on_diverse_payload_with_escapes():
     """A record with more than RANS_M distinct literal values forces the
     literal table's escape path within MODE_RANS_SPLIT specifically. Uses

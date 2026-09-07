@@ -2,6 +2,8 @@ import os
 import random
 import string
 
+import pytest
+
 from tokpress.codec.decoder import TokPressDecoder
 from tokpress.codec.encoder import (
     MODE_RANS_PPM,
@@ -36,6 +38,7 @@ def _payloads():
     ]
 
 
+@pytest.mark.slow
 def test_ppm_roundtrips():
     enc = TokPressEncoder()
     dec = TokPressDecoder()
@@ -47,6 +50,7 @@ def test_ppm_roundtrips():
         assert dec.decompress(comp) == payload
 
 
+@pytest.mark.slow
 def test_ppm_split_roundtrips():
     enc = TokPressEncoder()
     dec = TokPressDecoder()
@@ -58,6 +62,7 @@ def test_ppm_split_roundtrips():
         assert dec.decompress(comp) == payload
 
 
+@pytest.mark.slow
 def test_ppm_modes_roundtrip_fuzz():
     """Loop many varied payloads (matchy, sparse-bytes, random, text) -- the
     escape-to-order-0 cascade in these modes is the kind of micro-ordering
