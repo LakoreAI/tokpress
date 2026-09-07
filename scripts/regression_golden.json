@@ -1,0 +1,7 @@
+{
+  "batch_dict": 0.6096153846153847,
+  "per_record_dict": 0.6850961538461539,
+  "per_record_no_dict": 1.2175,
+  "whole_logs": 0.17208207349910495,
+  "whole_prose": 0.17925
+}

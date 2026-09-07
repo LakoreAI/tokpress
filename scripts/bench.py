@@ -862,6 +862,95 @@ def run_size_sweep() -> None:
         print(f"{size:>6}B      {per / total_raw:>10.3f} {per_dict / total_raw:>10.3f} {z_no:>10} {z_d:>10}")
 
 
+def run_priming_modes(path: Path | None = None, split_frac: float = 0.8) -> None:
+    """Compare the three TokDict priming-buffer constructions on the same
+    train/test split (docs/TODO.md item 2's "priming-buffer diversity"): head
+    concatenation ("concat", the default), the frequency-weighted coverage
+    picker ("coverage"), and the COVER-style marginal-diversity picker
+    ("diverse"). Every dictionary is measured as the MODE_RANS_DICT candidate
+    in isolation on the same held-out records, so only the priming material
+    differs. Reported honestly -- whichever construction wins is the default
+    only if it also wins at paper scale."""
+    path = path if path is not None else REAL_DATA / "json_heldout.jsonl"
+    if not path.is_file():
+        print(f"\n=== priming-buffer construction: SKIPPED (corpus not found at {path}) ===")
+        return
+    lines = [line for line in path.read_bytes().split(b"\n") if line]
+    if len(lines) < 10:
+        print(f"\n=== priming-buffer construction: SKIPPED (only {len(lines)} records) ===")
+        return
+    split = int(len(lines) * split_frac)
+    train_records, test_records = lines[:split], lines[split:]
+    total_raw = sum(len(r) for r in test_records)
+
+    print(
+        f"\n=== priming-buffer construction ({len(train_records)} train / {len(test_records)} "
+        f"held-out test records, {total_raw} test bytes) ==="
+    )
+    print(f"{'priming_mode':<10} {'per-record+dict':>16} {'batch+dict':>12} {'priming tokens':>16} {'roundtrip':>10}")
+    for mode in ("concat", "coverage", "diverse"):
+        d = TokDict.train(train_records, priming_mode=mode)
+        enc = TokPressEncoder(dictionary=d)
+        dec = TokPressDecoder(dictionary=d)
+        total = 0
+        ok = True
+        for r in test_records:
+            c = enc.compress(r, force_mode=MODE_RANS_DICT)
+            ok = ok and dec.decompress(c) == r
+            total += len(c)
+        packed = compress_many(test_records, dictionary=d)
+        ok = ok and decompress_many(packed, dictionary=d) == test_records
+        print(
+            f"{mode:<10} {total / total_raw:>16.4f} {len(packed) / total_raw:>12.4f} "
+            f"{len(d.priming_tokens):>16} {'OK' if ok else 'FAIL':>10}"
+        )
+
+
+def run_fast_mode(path: Path | None = None) -> None:
+    """Measure the --fast knob (one pre-chosen candidate, adaptive-split, no
+    min-gate) honestly: ratio and encode wall-time vs the default min-over-modes
+    gate, per record, on one schema-homogeneous corpus."""
+    path = path if path is not None else REAL_DATA / "json_heldout.jsonl"
+    if not path.is_file():
+        print(f"\n=== --fast mode: SKIPPED (corpus not found at {path}) ===")
+        return
+    lines = [line for line in path.read_bytes().split(b"\n") if line]
+    if not lines:
+        print("\n=== --fast mode: SKIPPED (empty corpus) ===")
+        return
+    total_raw = sum(len(r) for r in lines)
+
+    from tokpress.codec.encoder import MODE_RANS_ADAPTIVE_SPLIT
+
+    enc = TokPressEncoder()
+
+    def _run(force: bool) -> tuple[int, list[float]]:
+        total = 0
+        times: list[float] = []
+        for r in lines:
+            t0 = time.perf_counter()
+            if force:
+                total += len(enc.compress(r, force_mode=MODE_RANS_ADAPTIVE_SPLIT))
+            else:
+                total += len(enc.compress(r))
+            times.append(time.perf_counter() - t0)
+        return total, times
+
+    total_gate, t_gate = _run(False)
+    total_fast, t_fast = _run(True)
+    ratio_gate = total_gate / total_raw
+    ratio_fast = total_fast / total_raw
+
+    print("\n=== --fast (single adaptive-split candidate) vs min-over-modes gate ===")
+    print(f"{'mode':<22} {'ratio':>10} {'total encode ms':>16} {'rec/s':>10}")
+    print(
+        f"{'min-over-modes (default)':<22} {ratio_gate:>10.4f} {sum(t_gate) * 1000:>16.1f} {len(lines) / sum(t_gate):>10.1f}"
+    )
+    print(
+        f"{'--fast (adaptive-split only)':<22} {ratio_fast:>10.4f} {sum(t_fast) * 1000:>16.1f} {len(lines) / sum(t_fast):>10.1f}"
+    )
+
+
 def main() -> None:
     if not DATA_ROOT.is_dir():
         print(f"Vendored corpus root not found at {DATA_ROOT} -- no corpora available.")
@@ -884,6 +973,8 @@ def main() -> None:
     run_batch_attribution(REAL_DATA / "small_records.jsonl")
     run_cross_schema_generalization()
     run_size_sweep()
+    run_priming_modes()
+    run_fast_mode()
 
 
 if __name__ == "__main__":

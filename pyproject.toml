@@ -6,8 +6,27 @@ build-backend = "hatchling.build"
 name = "tokpress"
 version = "0.1.0"
 description = "A pure-Python, tiktoken-tokenizer-driven, rANS-entropy-coded lossless compressor."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = ["tiktoken>=0.5"]
+authors = [{ name = "Le Duc Minh" }]
+keywords = ["compression", "rans", "entropy-coding", "tiktoken", "bpe", "lz77", "dictionary"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Archiving :: Compression",
+]
+
+[project.urls]
+Homepage = "https://github.com/LakoreAI/tokpress"
+Repository = "https://github.com/LakoreAI/tokpress"
 
 [project.scripts]
 tokpress = "tokpress.cli:main"
@@ -24,6 +43,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: long-running tests (large-payload encode/round-trips, BPE training); excluded from the PR CI job",
+]
 
 [tool.ruff]
 line-length = 120

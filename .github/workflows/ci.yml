@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly full regression run (slow tests + ratio gate + real bench when
+    # corpora are present).
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  quick:
+    name: lint + fast tests (PR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Ruff lint
+        run: ruff check .
+      - name: Ruff format check
+        run: ruff format --check .
+      - name: Fast test subset
+        run: pytest tests/ -m "not slow" -q
+
+  nightly:
+    name: full tests + regression gate (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Full test suite (incl. @slow)
+        run: pytest tests/ -q
+      - name: Ratio regression gate
+        run: python scripts/bench_regression.py
+      - name: Real bench (skips corpora absent from CI)
+        run: python scripts/bench.py || true

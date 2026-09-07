@@ -89,15 +89,39 @@ tokpress train-vocab myvocab.ranks corpus1.txt corpus2.txt ...
 ```python
 import tokpress
 
-compressed = tokpress.compress(payload)          # payload: bytes or str
-original = tokpress.decompress(compressed)       # -> bytes, byte-exact
+compressed = tokpress.compress(payload)  # payload: bytes or str
+original = tokpress.decompress(compressed)  # -> bytes, byte-exact
 
 records = [b'{"user": "u1"}', b'{"user": "u2"}']
-packed = tokpress.compress_many(records)         # one adaptive stream
+packed = tokpress.compress_many(records)  # one adaptive stream
 assert tokpress.decompress_many(packed) == records
 
-stats = tokpress.tokenize_stats(payload)         # tokenizer-quality stats
+stats = tokpress.tokenize_stats(payload)  # tokenizer-quality stats
 ```
+
+### Integrity and mismatch protection
+
+Lossless compressors that decode into silently-wrong bytes are the worst kind
+of bug, so TokPress has three guards:
+
+- **Wrong vocabulary raises.** Any stream compressed with a non-default
+  vocabulary (`--vocab` / a custom `tokenizer=`) carries an 8-byte vocabulary
+  fingerprint. Decompressing it against a different rank file raises instead
+  of corrupting silently. Plain `o200k_base` streams are untouched (no stamp,
+  byte-identical output).
+- **Wrong dictionary raises.** A stream compressed with a `TokDict` carries an
+  8-byte fingerprint of it and refuses to decompress against the wrong one.
+- **`--integrity` makes corruption loud.** `tokpress compress --integrity`
+  (or `compress(..., integrity=True)`, `pack --integrity`) appends a crc32 of
+  the input (+4 bytes/stream). Decompression then detects a flipped bit,
+  truncation, or a decode under the wrong model instead of returning wrong
+  bytes. Opt-in because it costs bytes on every stream.
+
+`--fast` (compress only) emits a single pre-chosen entropy candidate
+(adaptive-split) instead of the min-over-modes gate: on whole files it costs
+~4% ratio for ~12% less encode time; on records under ~512 tokens it is
+ratio-neutral (that candidate wins the gate anyway) but only ~5% faster. It
+cannot be combined with `--dict`.
 
 ### Trained dictionaries (many small, schema-similar records)
 
@@ -190,15 +214,22 @@ pip install -e .
 pytest tests/
 ```
 
-The suite (99 tests) covers bitstream and rANS roundtrips (incl. the
+The suite (109 tests) covers bitstream and rANS roundtrips (incl. the
 single-symbol-alphabet edge case), token-level LZ77 roundtrip, the tiktoken
 adapter's byte-exact roundtrip on arbitrary binary input (including invalid
 UTF-8), full codec roundtrips across payload shapes, `TokDict`
-training/save/load/escape-cascade roundtrips (incl. the ablation knobs and
-coverage priming), the batch mode
-(`compress_many`/`decompress_many`), the BPE trainer (merge-chain validity,
+training/save/load/escape-cascade roundtrips (incl. the ablation knobs,
+coverage/diversity priming, and fingerprint rejection of a wrong dictionary),
+the batch and indexed-batch modes, the BPE trainer (merge-chain validity,
 determinism, tiktoken agreement, rank-file roundtrip), custom-vocab codec
-roundtrips, `tokenize_stats` invariants, and black-box package/CLI tests.
+roundtrips (incl. the identity-stamp rejection of a wrong vocabulary), the
+opt-in integrity trailer (corruption and wrong-model decode raise instead of
+returning wrong bytes), the escape-capped high-vocabulary adaptive/PPM modes,
+`tokenize_stats` invariants, and black-box package/CLI tests. Heavy
+large-payload tests are marked `@pytest.mark.slow` (`make test-quick` skips
+them). A self-contained ratio regression gate (`scripts/bench_regression.py`,
+deterministic synthetic corpora, no external data) fails on any accidental
+wire-format/table regression and runs nightly in CI alongside the full suite.
 
 ---
 

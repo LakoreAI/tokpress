@@ -441,5 +441,17 @@ __marimo__/
 
 # Project-specific ignores
 
+# Bench corpora live in the working tree, not in git (see data/bench/README.md:
+# provenance + SHA-256 hashes; scripts/regenerate_bench_data.py verifies them).
 data/
-docs/
+
+# docs/ is tracked (STATUS/TODO/VISION + the paper's .tex source and .pdf), but
+# not the LaTeX build by-products or the doc build output.
+docs/_build/
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.fls
+docs/*.fdb_latexmk
+
+*.md
