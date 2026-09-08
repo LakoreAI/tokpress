@@ -192,14 +192,15 @@ use the `--max-bytes` cap to sample the corpus (default 256 KB).
 ### Measured, honestly
 
 On real held-out JSON log records (`scripts/bench.py`'s trained-dictionary
-regime), with a `TokDict` trained on a disjoint training split:
+regime), with a `TokDict` trained on a disjoint training split (paper-scale
+split, 46 held-out records; repeated-seeded-split means are ~0.254 / 0.226):
 
 | backend | ratio (held-out records) |
 |---|---|
-| per-record, no dictionary | 0.806 |
-| per-record + `TokDict` | 0.2565 |
-| **batch (`compress_many`) + `TokDict`** | **0.228** |
-| `zstd -19` + matched dict, batch (blob) | 0.137 |
+| per-record, no dictionary | 0.8078 |
+| per-record + `TokDict` | 0.2554 |
+| **batch (`compress_many`) + `TokDict`** | **0.2309** |
+| `zstd -19` + matched dict, batch (blob) | 0.1371 |
 
 TokPress beats every dictionary-less baseline and most of the gap to zstd's
 matched dictionary, but zstd's mature COVER/FastCover dictionary training
@@ -214,12 +215,13 @@ pip install -e .
 pytest tests/
 ```
 
-The suite (109 tests) covers bitstream and rANS roundtrips (incl. the
+The suite (111 tests) covers bitstream and rANS roundtrips (incl. the
 single-symbol-alphabet edge case), token-level LZ77 roundtrip, the tiktoken
 adapter's byte-exact roundtrip on arbitrary binary input (including invalid
 UTF-8), full codec roundtrips across payload shapes, `TokDict`
 training/save/load/escape-cascade roundtrips (incl. the ablation knobs,
-coverage/diversity priming, and fingerprint rejection of a wrong dictionary),
+coverage/diversity priming, the 4096-token priming-cap default, and
+fingerprint rejection of a wrong dictionary),
 the batch and indexed-batch modes, the BPE trainer (merge-chain validity,
 determinism, tiktoken agreement, rank-file roundtrip), custom-vocab codec
 roundtrips (incl. the identity-stamp rejection of a wrong vocabulary), the

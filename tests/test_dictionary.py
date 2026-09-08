@@ -178,6 +178,40 @@ def test_coverage_priming_obeys_budget():
     assert len(d.priming_tokens) <= 50
 
 
+def _large_records(n: int, size: int = 500) -> list[bytes]:
+    """Schema-homogeneous records big enough to exceed the default priming
+    cap in aggregate: ~size bytes each, sharing a long fixed prefix so their
+    token streams are LZ-matchable against a shared dictionary."""
+    prefix = '{"user": "u", "action": "click", "page": "/home", "region": "eu-west", "items": ['
+    suffix = '], "ts": %d}'
+    payload = '"abcdefghijklmnopqrstuvwxyz",' * (size // 30)
+    return [(prefix + payload + suffix % (1700000000 + i)).encode() for i in range(n)]
+
+
+def test_default_priming_cap_is_4096():
+    """Regression guard for the default `max_priming_tokens`: 4096, not the
+    older 8192. Measured across real corpora and repeated 80/20 splits, a
+    larger buffer spreads the baked distance/length-table mass and *hurts*
+    per-record dict compression (json logs 0.2625 -> 0.2549, package metadata
+    0.3885 -> 0.3752, small records 0.5468 -> 0.3397 at 8192 vs 4096), so the
+    default must stay small. A training corpus with more tokens than either
+    cap must therefore stop at 4096."""
+    d = TokDict.train(_large_records(120))
+    assert len(d.priming_tokens) == 4096  # corpus exceeds the cap; buffer stops at it
+
+    d_big = TokDict.train(_large_records(120), max_priming_tokens=8192)
+    assert len(d_big.priming_tokens) == 8192
+    assert d.fingerprint != d_big.fingerprint
+
+
+def test_default_cap_dict_roundtrips_on_large_records():
+    d = TokDict.train(_large_records(120))
+    enc = TokPressEncoder(dictionary=d)
+    dec = TokPressDecoder(dictionary=d)
+    record = _large_records(1, size=500)[0]
+    assert dec.decompress(enc.compress(record)) == record
+
+
 def test_invalid_priming_mode_raises():
     with pytest.raises(ValueError):
         TokDict.train(TRAIN_RECORDS, priming_mode="bogus")
