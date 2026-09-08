@@ -1,4 +1,4 @@
-.PHONY: help install dev test test-quick lint lint-fix format format-check pre-commit clean check paper paper-clean bench regression
+.PHONY: help install dev test test-quick lint lint-fix format format-check pre-commit clean check paper paper-clean bench bench-encodings regression
 
 VENV ?= .venv
 BIN := $(shell [ -d $(VENV)/bin ] && echo $(VENV)/bin/ || echo "")
@@ -16,6 +16,7 @@ help:
 	@echo "  make pre-commit    Run pre-commit hooks on all files"
 	@echo "  make check         Run lint, format check, and test-quick suite"
 	@echo "  make bench         Run the full benchmark harness (needs data/bench corpora)"
+	@echo "  make bench-encodings  Compare tiktoken encodings + domain byte-BPE through the codec (needs data/bench corpora)"
 	@echo "  make regression    Run the self-contained ratio regression gate (scripts/bench_regression.py)"
 	@echo "  make paper         Rebuild docs/tokpress.pdf from docs/tokpress.tex (needs latexmk)"
 	@echo "  make paper-clean   Remove LaTeX build by-products"
@@ -53,6 +54,9 @@ check: lint format-check test-quick
 
 bench:
 	$(BIN)python scripts/bench.py
+
+bench-encodings:
+	$(BIN)python scripts/bench_encodings.py
 
 regression:
 	$(BIN)python scripts/bench_regression.py

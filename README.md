@@ -294,6 +294,39 @@ native compressors. The interesting result is that tokenizing before
 entropy-coding at all is competitive with whole-file gzip on plain prose
 without any shared dictionary.
 
+### Which tiktoken encoding should I use?
+
+TokPress defaults to `o200k_base` (the tokenizer behind OpenAI's GPT-4o
+models). The other encodings tiktoken ships can be swapped in by constructing
+`TiktokenTokenizer(encoding_name=...)` and passing `tokenizer=` to the API —
+all five are byte-exact on arbitrary input through this codec. Measured on the
+same corpora (ratio, lower is better):
+
+Whole-file, no dictionary:
+
+| encoding | vocab | prose (alice29) | C code (fields.c) | JSON logs |
+|---|---|---|---|---|
+| `cl100k_base` | 100,277 | **0.2970** | **0.3341** | **0.1968** |
+| **`o200k_base` (default)** | 200,019 | 0.2976 | 0.3362 | 0.1979 |
+| `p50k_base` / `r50k_base` / `gpt2` | ~50k | 0.3090–0.3109 | 0.3542–0.3640 | 0.2035 |
+
+Trained-`TokDict` regime (json_heldout, 184 train / 46 held-out records):
+
+| encoding | per no-dict | per + `TokDict` | batch + `TokDict` |
+|---|---|---|---|
+| `byte-BPE @4096` (custom) | **0.6046** | 0.2988 | 0.2470 |
+| **`o200k_base` (default)** | 0.8078 | **0.2554** | **0.2309** |
+| `cl100k_base` | 0.7988 | 0.2717 | 0.2311 |
+| `p50k_base` / `r50k_base` / `gpt2` | 0.8618 | 0.2711 | 0.2422 |
+
+The takeaway is consistent with the [custom-vocabulary FAQ](#faq): the default
+`o200k_base` is already the right choice for the target dictionary/batch
+regime; `cl100k_base` edges it by ~0.5% on whole-file/no-dictionary
+compression only, and the ~50k-vocab encodings lose everywhere it matters. A
+small vocabulary wins in exactly one niche — independent per-record
+compression with no dictionary — where it merely shrinks the per-record header.
+Single-split/single-file measurements; deltas under ~1% are near split noise.
+
 ---
 
 ## When to use it, when not to
@@ -407,6 +440,16 @@ supplies the domain structure, the positions reverse — `o200k_base` wins
 the alphabet and the larger, better-tuned merge stream then dominates. So:
 train a vocabulary for dictionary-less per-record work; keep `o200k_base` when
 you are already training a `TokDict`.
+
+**Which tiktoken encoding should I use — `o200k_base` or `cl100k_base`?**
+`o200k_base` (the default) is the right choice for TokPress's target workload.
+Measured head-to-head, `cl100k_base` is a hair better only on whole-file,
+no-dictionary compression (~0.5% smaller on prose/code/JSON), while
+`o200k_base` wins the trained-dictionary regime (per-record+dict 0.2554 vs
+0.2717, batch+dict 0.2309 vs 0.2311). The ~50k-vocab encodings
+(`p50k_base`/`r50k_base`/`gpt2`) lose in both regimes. Keep the default unless
+your workload is exclusively whole-file compression with no dictionary — then
+`cl100k_base` is a measured, if small, win.
 
 **What are the dependencies and license?**
 One runtime dependency (`tiktoken`), Python 3.10+, Apache-2.0.
