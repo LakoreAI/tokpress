@@ -111,7 +111,7 @@ neural network at compress time).
 | **Language** | Pure Python (3.10+) |
 | **Dependencies** | `tiktoken` only |
 | **License** | Apache-2.0 |
-| **Verification** | 111 tests + a deterministic ratio-regression gate in CI |
+| **Verification** | 115 tests + a deterministic ratio-regression gate in CI |
 
 ---
 
@@ -362,13 +362,14 @@ pip install -e .
 pytest tests/
 ```
 
-The suite (111 tests) covers bitstream and rANS roundtrips (incl. the
+The suite (115 tests) covers bitstream and rANS roundtrips (incl. the
 single-symbol-alphabet edge case), token-level LZ77 roundtrip, the tiktoken
 adapter's byte-exact roundtrip on arbitrary binary input (including invalid
 UTF-8), full codec roundtrips across payload shapes, `TokDict`
-training/save/load/escape-cascade roundtrips (incl. the ablation knobs,
-coverage/diversity priming, the 4096-token priming-cap default, and
-fingerprint rejection of a wrong dictionary), the batch and indexed-batch
+training/save/load/escape-cascade roundtrips (incl. the ablation knobs, all
+four priming-buffer constructions -- concat/coverage/diverse/cover -- the
+4096-token priming-cap default, and fingerprint rejection of a wrong
+dictionary), the batch and indexed-batch
 modes, the BPE trainer (merge-chain validity, determinism, tiktoken
 agreement, rank-file roundtrip), custom-vocab codec roundtrips (incl. the
 identity-stamp rejection of a wrong vocabulary), the opt-in integrity trailer

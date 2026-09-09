@@ -72,6 +72,34 @@ def test_cli_train_dict_splits_jsonl_into_records(tmp_path):
     assert restored.read_bytes() == heldout.read_bytes()
 
 
+def test_cli_train_dict_priming_mode_flag(tmp_path):
+    """--priming-mode is threaded through to TokDict.train and round-trips
+    through compress/decompress using the resulting dictionary; an invalid
+    mode must fail rather than silently falling back to the default."""
+    jsonl = tmp_path / "logs.jsonl"
+    lines = [f'{{"user": "u{i}", "action": "click", "ts": {1700000000 + i}}}' for i in range(40)]
+    jsonl.write_text("\n".join(lines) + "\n")
+
+    dict_file = tmp_path / "dict.tokdict"
+    res = _run("train-dict", str(dict_file), str(jsonl), "--priming-mode", "cover")
+    assert res.returncode == 0, res.stderr
+    assert "priming mode:    cover" in res.stdout
+
+    heldout = tmp_path / "heldout.jsonl"
+    heldout.write_text('{"user": "u99", "action": "click", "ts": 1700000099}\n')
+    tokz = tmp_path / "heldout.tokz"
+    restored = tmp_path / "restored.jsonl"
+
+    assert _run("compress", str(heldout), "-o", str(tokz), "--dict", str(dict_file)).returncode == 0
+    assert _run("decompress", str(tokz), "-o", str(restored), "--dict", str(dict_file)).returncode == 0
+    assert restored.read_bytes() == heldout.read_bytes()
+
+    bad_dict = tmp_path / "bad.tokdict"
+    res_bad = _run("train-dict", str(bad_dict), str(jsonl), "--priming-mode", "bogus")
+    assert res_bad.returncode != 0
+    assert not bad_dict.exists()
+
+
 def test_cli_train_dict_single_binary_record_stays_whole(tmp_path):
     """A binary sample with no newlines must stay one record, not be split."""
     blob = tmp_path / "blob.bin"

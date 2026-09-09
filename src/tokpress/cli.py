@@ -19,9 +19,9 @@ HELP_TEXT = """Usage:
   tokpress read <indexed.tokz> <index> [-o <output_path>] [--dict <dict.tokdict>] [--vocab <vocab.ranks>]
   tokpress bench <input_path>
   tokpress tokenize-stats <input_path> [--vocab <vocab.ranks>]
-  tokpress train-dict <output.tokdict> <sample_path> [sample_path ...]
+  tokpress train-dict <output.tokdict> <sample_path> [sample_path ...] [--priming-mode MODE]
   tokpress train-vocab <output.ranks> <corpus_path> [corpus_path ...] [--vocab-size N] [--max-bytes N]
-  tokpress fit <out_prefix> <corpus_path> [corpus_path ...] [--vocab-size N] [--max-bytes N]
+  tokpress fit <out_prefix> <corpus_path> [corpus_path ...] [--vocab-size N] [--max-bytes N] [--priming-mode MODE]
 
 Options:
   -o, --output <PATH>     Specify output filepath
@@ -40,6 +40,13 @@ Options:
                           candidate (adaptive-split) instead of the min-over-
                           modes gate -- much less encoder work, a few percent
                           worse ratio, and not usable with --dict
+  --priming-mode MODE     train-dict/fit: how the LZ priming buffer is built
+                          from the sample records -- "concat" (default, head-
+                          concatenation), "coverage" (frequent-token-mass
+                          record picker), "diverse" (marginal-coverage record
+                          picker), or "cover" (segment-level, zstd-COVER-style
+                          d-mer scoring; usually the best per-record picker,
+                          "concat" usually wins batch mode -- see README)
 
 Streams compressed with a custom --vocab always carry an 8-byte vocabulary
 fingerprint, so decompressing with the wrong vocab raises even without
@@ -90,6 +97,9 @@ def _parse_flags(args: list[str], start: int) -> dict:
         elif args[i] == "--vocab" and i + 1 < len(args):
             flags["vocab"] = args[i + 1]
             i += 2
+        elif args[i] == "--priming-mode" and i + 1 < len(args):
+            flags["priming_mode"] = args[i + 1]
+            i += 2
         elif args[i] == "--indexed":
             flags["indexed"] = True
             i += 1
@@ -104,7 +114,7 @@ def _parse_flags(args: list[str], start: int) -> dict:
     return flags
 
 
-_FLAG_TOKENS = ("-o", "--output", "--dict", "--vocab", "--vocab-size", "--max-bytes")
+_FLAG_TOKENS = ("-o", "--output", "--dict", "--vocab", "--vocab-size", "--max-bytes", "--priming-mode")
 _VALUE_LESS_FLAGS = ("--indexed", "--integrity", "--fast")
 
 
@@ -255,18 +265,21 @@ def cmd_train_dict(args: list[str]) -> int:
         print_help()
         return 1
     output_path = args[2]
-    sample_paths = args[3:]
+    flags = _parse_flags(args, 3)
+    sample_paths = _parse_positional(args, 3)
+    priming_mode = flags.get("priming_mode", "concat")
 
     samples = []
     for path in sample_paths:
         samples.extend(_load_sample_records(path))
 
-    dictionary = TokDict.train(samples)
+    dictionary = TokDict.train(samples, priming_mode=priming_mode)
     dictionary.save(output_path)
 
     n_active = sum(1 for f in dictionary.stats.freq if f > 0)
     print(f"Trained dictionary: {output_path}")
     print(f"  samples:         {len(samples)}")
+    print(f"  priming mode:    {priming_mode}")
     print(f"  priming tokens:  {len(dictionary.priming_tokens)}")
     print(f"  table symbols:   {n_active}")
     return 0
@@ -352,6 +365,8 @@ def cmd_fit(args: list[str]) -> int:
     vocab_size = 4096
     max_bytes = 256 * 1024
     corpus_paths = _parse_positional(args, 3)
+    flags = _parse_flags(args, 3)
+    priming_mode = flags.get("priming_mode", "concat")
     if "--vocab-size" in args or "--max-bytes" in args:
         i = 3
         while i < len(args):
@@ -387,7 +402,7 @@ def cmd_fit(args: list[str]) -> int:
     bpe_trainer.dump_rank_file(ranks, ranks_path)
     tokenizer = TiktokenTokenizer(encoding=bpe_trainer.build_tiktoken_encoding(ranks, name=ranks_path))
 
-    dictionary = TokDict.train(records, tokenizer=tokenizer)
+    dictionary = TokDict.train(records, tokenizer=tokenizer, priming_mode=priming_mode)
     dictionary.save(tokdict_path)
     elapsed = time.perf_counter() - t0
 

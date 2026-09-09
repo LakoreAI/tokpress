@@ -212,6 +212,38 @@ def test_default_cap_dict_roundtrips_on_large_records():
     assert dec.decompress(enc.compress(record)) == record
 
 
+def test_cover_priming_is_deterministic_and_valid():
+    d1 = TokDict.train(TRAIN_RECORDS, priming_mode="cover")
+    d2 = TokDict.train(TRAIN_RECORDS, priming_mode="cover")
+    assert d1.priming_tokens == d2.priming_tokens
+    assert len(d1.priming_tokens) > 0
+
+    enc = TokPressEncoder(dictionary=d1)
+    dec = TokPressDecoder(dictionary=d1)
+    record = b'{"user": "u999", "action": "click", "page": "/home", "ts": 1700009999}'
+    assert dec.decompress(enc.compress(record)) == record
+
+
+def test_cover_priming_obeys_budget():
+    d = TokDict.train(TRAIN_RECORDS, priming_mode="cover", max_priming_tokens=50)
+    assert len(d.priming_tokens) <= 50
+
+
+def test_cover_priming_handles_records_shorter_than_dmer():
+    """Every training record must be shorter than the default d-mer length
+    (8 tokens) for this to exercise the 'no d-mers at all' fallback path --
+    the picker must return an empty (not crashing) priming buffer rather
+    than raise."""
+    tiny_records = [f"u{i}".encode() for i in range(20)]
+    d = TokDict.train(tiny_records, priming_mode="cover")
+    assert d.priming_tokens == []
+
+    enc = TokPressEncoder(dictionary=d)
+    dec = TokPressDecoder(dictionary=d)
+    record = b"u999"
+    assert dec.decompress(enc.compress(record)) == record
+
+
 def test_invalid_priming_mode_raises():
     with pytest.raises(ValueError):
         TokDict.train(TRAIN_RECORDS, priming_mode="bogus")

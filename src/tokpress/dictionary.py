@@ -106,7 +106,14 @@ class TokDict:
         over that: it re-scans at every pick and takes the record adding the
         most *new* frequent-token mass (a record whose tokens are already
         covered gains almost nothing), trading representativeness for
-        diversity -- see _priming_tokens_diverse.
+        diversity -- see _priming_tokens_diverse; "cover" is the actual
+        zstd-COVER mechanism (RESEARCH.md Sec 2.5) rather than an analogue of
+        it: fixed-length token *segments* (not whole records) are scored by
+        the corpus-wide frequency of the d-mers (length-8 token n-grams) they
+        contain, the highest-scoring segment is picked, and every d-mer it
+        contains is then *discounted* (zeroed) so overlapping or
+        near-duplicate segments stop scoring well on the next pick -- see
+        _priming_tokens_cover.
         """
         if not samples:
             raise ValueError("TokDict.train needs at least one sample record")
@@ -126,6 +133,8 @@ class TokDict:
             priming_tokens = cls._priming_tokens_coverage(samples, tokenizer, max_priming_tokens)
         elif priming_mode == "diverse":
             priming_tokens = cls._priming_tokens_diverse(samples, tokenizer, max_priming_tokens)
+        elif priming_mode == "cover":
+            priming_tokens = cls._priming_tokens_cover(samples, tokenizer, max_priming_tokens)
         elif priming_mode == "concat":
             priming_tokens = []
             for sample in samples:
@@ -134,7 +143,9 @@ class TokDict:
                     break
             priming_tokens = priming_tokens[:max_priming_tokens]
         else:
-            raise ValueError(f"unknown priming_mode: {priming_mode!r} (expected 'concat', 'coverage', or 'diverse')")
+            raise ValueError(
+                f"unknown priming_mode: {priming_mode!r} (expected 'concat', 'coverage', 'diverse', or 'cover')"
+            )
 
         if not use_priming:
             priming_tokens = []
@@ -261,6 +272,116 @@ class TokDict:
             if len(priming) >= max_priming_tokens:
                 break
             priming.extend(toks[: max_priming_tokens - len(priming)])
+        return priming
+
+    @staticmethod
+    def _priming_tokens_cover(
+        samples: list[bytes],
+        tokenizer: TiktokenTokenizer,
+        max_priming_tokens: int,
+        segment_len: int = 256,
+        dmer_len: int = 8,
+        discount: float = 0.3,
+    ) -> list[int]:
+        """The actual zstd-COVER mechanism (RESEARCH.md Sec 2.5), not an
+        analogue of it: `_priming_tokens_coverage`/`_priming_tokens_diverse`
+        above both score and pick whole *records*; real COVER scores and
+        picks fixed-length *segments* of the corpus by the corpus-wide
+        frequency of the d-mers (length-`dmer_len` token n-grams) they
+        contain, greedily takes the highest-scoring segment, and then
+        *discounts* every d-mer it contains so an overlapping or
+        near-duplicate segment stops scoring as well on the next pick -- the
+        discount step is what a whole-record picker structurally cannot do
+        (a record is either fully in or fully out).
+
+        Segment scores use log1p-dampened d-mer frequency (matching
+        `_priming_tokens_coverage`/`_priming_tokens_diverse`'s dampening)
+        rather than a raw frequency sum: measured on real corpora, a raw sum
+        lets a handful of ultra-common structural d-mers (JSON punctuation,
+        repeated key names) dominate segment choice, picking redundant
+        material; log-dampening favors segments with more distinct valuable
+        d-mers instead. `discount` scales (not zeroes) a picked d-mer's
+        remaining frequency (`freq *= discount`) rather than fully removing
+        it -- a *partial* discount measurably beat a full zero-out on repeated
+        splits (see the priming-buffer-construction ablation in
+        `scripts/bench.py`'s `run_priming_modes` / `TODO.md`): a segment that
+        is mostly-but-not-entirely redundant with an already-picked one can
+        still contribute the part that is new.
+
+        Candidate segments are `segment_len`-token sliding windows (stride
+        `segment_len // 2`, so windows overlap by half) over every record's
+        token stream; a record shorter than `segment_len` is its own single
+        candidate, and a record shorter than `dmer_len` contributes no d-mers
+        and is skipped entirely. Deterministic: ties break by the order
+        candidates were generated (record index, then segment start).
+
+        This is quadratic-ish in the number of candidate segments (rescans
+        all remaining candidates on every pick, like `_priming_tokens_diverse`)
+        -- fine for training-time use on the corpus sizes this project
+        targets, not intended for a hot path.
+
+        Honest result (repeated 80/20 splits, 3 real schemas -- see
+        `docs/RESEARCH.md`): this mode is not a clean win over `concat` or
+        `diverse` (it wins per-record on json logs, loses on package
+        metadata, is close-but-not-best on batch mode everywhere). Kept as an
+        available, fully-tested option -- like `coverage`/`diverse` -- rather
+        than the default; the negative/mixed result is itself the useful
+        finding (it reinforces `TODO.md`'s existing conclusion that the
+        priming *cap*, not the picker's sophistication, is the dominant
+        lever).
+        """
+        tokenized = [tokenizer.encode(s) for s in samples]
+
+        dmer_freq: dict[tuple[int, ...], int] = {}
+        for toks in tokenized:
+            for i in range(len(toks) - dmer_len + 1):
+                dmer = tuple(toks[i : i + dmer_len])
+                dmer_freq[dmer] = dmer_freq.get(dmer, 0) + 1
+
+        if not dmer_freq:
+            return []  # every record shorter than dmer_len -- no d-mers to score by
+
+        stride = max(1, segment_len // 2)
+        candidates: list[tuple[int, int, int]] = []  # (record idx, start, end)
+        for ridx, toks in enumerate(tokenized):
+            n = len(toks)
+            if n < dmer_len:
+                continue
+            if n <= segment_len:
+                candidates.append((ridx, 0, n))
+                continue
+            start = 0
+            while start < n:
+                end = min(start + segment_len, n)
+                if end - start >= dmer_len:
+                    candidates.append((ridx, start, end))
+                if end == n:
+                    break
+                start += stride
+
+        def segment_dmers(ridx: int, start: int, end: int) -> list[tuple[int, ...]]:
+            toks = tokenized[ridx]
+            return [tuple(toks[i : i + dmer_len]) for i in range(start, end - dmer_len + 1)]
+
+        priming: list[int] = []
+        remaining = candidates
+        while remaining and len(priming) < max_priming_tokens:
+            best_score = 0.0
+            best_pos = -1
+            best_dmers: list[tuple[int, ...]] = []
+            for pos, (ridx, start, end) in enumerate(remaining):
+                dmers = segment_dmers(ridx, start, end)
+                s = sum(math.log1p(dmer_freq.get(dm, 0)) for dm in dmers)
+                if s > best_score:
+                    best_score = s
+                    best_pos = pos
+                    best_dmers = dmers
+            if best_pos < 0:
+                break  # every remaining segment's d-mers are already discounted to zero score
+            ridx, start, end = remaining.pop(best_pos)
+            priming.extend(tokenized[ridx][start:end][: max_priming_tokens - len(priming)])
+            for dm in best_dmers:
+                dmer_freq[dm] = int(dmer_freq[dm] * discount)
         return priming
 
     @staticmethod

@@ -863,14 +863,16 @@ def run_size_sweep() -> None:
 
 
 def run_priming_modes(path: Path | None = None, split_frac: float = 0.8) -> None:
-    """Compare the three TokDict priming-buffer constructions on the same
+    """Compare the four TokDict priming-buffer constructions on the same
     train/test split (docs/TODO.md item 2's "priming-buffer diversity"): head
     concatenation ("concat", the default), the frequency-weighted coverage
-    picker ("coverage"), and the COVER-style marginal-diversity picker
-    ("diverse"). Every dictionary is measured as the MODE_RANS_DICT candidate
-    in isolation on the same held-out records, so only the priming material
-    differs. Reported honestly -- whichever construction wins is the default
-    only if it also wins at paper scale."""
+    picker ("coverage"), the COVER-style marginal-diversity picker
+    ("diverse"), and the actual zstd-COVER mechanism ("cover": segment-level
+    d-mer scoring with discounting, RESEARCH.md Sec 2.5). Every dictionary is
+    measured as the MODE_RANS_DICT candidate in isolation on the same
+    held-out records, so only the priming material differs. Reported
+    honestly -- whichever construction wins is the default only if it also
+    wins at paper scale."""
     path = path if path is not None else REAL_DATA / "json_heldout.jsonl"
     if not path.is_file():
         print(f"\n=== priming-buffer construction: SKIPPED (corpus not found at {path}) ===")
@@ -888,7 +890,7 @@ def run_priming_modes(path: Path | None = None, split_frac: float = 0.8) -> None
         f"held-out test records, {total_raw} test bytes) ==="
     )
     print(f"{'priming_mode':<10} {'per-record+dict':>16} {'batch+dict':>12} {'priming tokens':>16} {'roundtrip':>10}")
-    for mode in ("concat", "coverage", "diverse"):
+    for mode in ("concat", "coverage", "diverse", "cover"):
         d = TokDict.train(train_records, priming_mode=mode)
         enc = TokPressEncoder(dictionary=d)
         dec = TokPressDecoder(dictionary=d)
@@ -904,6 +906,64 @@ def run_priming_modes(path: Path | None = None, split_frac: float = 0.8) -> None
             f"{mode:<10} {total / total_raw:>16.4f} {len(packed) / total_raw:>12.4f} "
             f"{len(d.priming_tokens):>16} {'OK' if ok else 'FAIL':>10}"
         )
+
+
+def run_priming_modes_repeated(n_splits: int = 25, split_frac: float = 0.8, seed: int = 0) -> None:
+    """The repeated-split companion to `run_priming_modes` (docs/TODO.md's
+    "picker-comparison methodology" item, docs/RESEARCH.md Sec 2.6): a single
+    80/20 split is not enough draws to rank priming_mode constructions whose
+    differences are a few percent apart, because the held-out sets here are
+    small (10-75 records). Uses n_splits=25 (vs run_repeated_splits's 5)
+    specifically because 5 was measured to flip the concat-vs-diverse ranking
+    depending on unrelated RNG mechanics (a fresh Random(i) per split vs one
+    continuously-advancing Random(seed)) -- more draws are needed before a
+    winner here is trustworthy. Reports mean +- stdev per schema so the
+    spread, not just the mean, is visible."""
+    schemas = {
+        "json logs": REAL_DATA / "json_heldout.jsonl",
+        "small records": REAL_DATA / "small_records.jsonl",
+        "package metadata": REAL_DATA / "package_metadata.jsonl",
+    }
+    for schema_name, path in schemas.items():
+        if not path.is_file():
+            print(f"\n=== priming-mode repeated splits ({schema_name}): SKIPPED (not found) ===")
+            continue
+        lines = [line for line in path.read_bytes().split(b"\n") if line]
+        if len(lines) < 10:
+            print(f"\n=== priming-mode repeated splits ({schema_name}): SKIPPED (only {len(lines)} records) ===")
+            continue
+
+        rng = random.Random(seed)
+        per_series: dict[str, list[float]] = {m: [] for m in ("concat", "coverage", "diverse", "cover")}
+        batch_series: dict[str, list[float]] = {m: [] for m in ("concat", "coverage", "diverse", "cover")}
+        for _ in range(n_splits):
+            shuffled = lines[:]
+            rng.shuffle(shuffled)
+            split = int(len(shuffled) * split_frac)
+            train_records, test_records = shuffled[:split], shuffled[split:]
+            total_raw = sum(len(r) for r in test_records)
+            for mode in per_series:
+                d = TokDict.train(train_records, priming_mode=mode)
+                enc = TokPressEncoder(dictionary=d)
+                dec = TokPressDecoder(dictionary=d)
+                total = 0
+                for r in test_records:
+                    c = enc.compress(r, force_mode=MODE_RANS_DICT)
+                    assert dec.decompress(c) == r
+                    total += len(c)
+                packed = compress_many(test_records, dictionary=d)
+                assert decompress_many(packed, dictionary=d) == test_records
+                per_series[mode].append(total / total_raw)
+                batch_series[mode].append(len(packed) / total_raw)
+
+        print(f"\n=== priming-mode repeated splits: {schema_name} ({len(lines)} records, {n_splits} splits) ===")
+        print(f"{'mode':<10} {'per-record mean':>16} {'+- stdev':>10} {'batch mean':>12} {'+- stdev':>10}")
+        for mode in per_series:
+            per_mean = statistics.mean(per_series[mode])
+            per_sd = statistics.stdev(per_series[mode])
+            batch_mean = statistics.mean(batch_series[mode])
+            batch_sd = statistics.stdev(batch_series[mode])
+            print(f"{mode:<10} {per_mean:>16.4f} {per_sd:>10.4f} {batch_mean:>12.4f} {batch_sd:>10.4f}")
 
 
 def run_fast_mode(path: Path | None = None) -> None:
@@ -974,6 +1034,7 @@ def main() -> None:
     run_cross_schema_generalization()
     run_size_sweep()
     run_priming_modes()
+    run_priming_modes_repeated()
     run_fast_mode()
 
 
