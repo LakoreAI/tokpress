@@ -47,6 +47,15 @@ impl DictData {
         contexts: Vec<(u32, Vec<(u32, u32)>)>,
         fingerprint: Vec<u8>,
     ) -> Result<DictData, String> {
+        if alphabet_size == 0 {
+            return Err("TokDict alphabet_size must be >= 1".to_string());
+        }
+        if fingerprint.len() != 8 {
+            return Err(format!(
+                "TokDict fingerprint must be 8 bytes, got {}",
+                fingerprint.len()
+            ));
+        }
         let mut ctx = HashMap::with_capacity(contexts.len());
         for (c, pairs) in contexts {
             ctx.insert(c, build_table(pairs)?);

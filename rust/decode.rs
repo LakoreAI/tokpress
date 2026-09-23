@@ -6,6 +6,7 @@ use crate::encode::*;
 use crate::rans::RansDecoder;
 use crate::stats::{Stats, RANS_M, RANS_M_BITS};
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 pub struct Decoded {
     pub mode: u8,
@@ -95,9 +96,7 @@ fn ppm_table(
         entries.push((k + 1, 1));
         t += 1;
     }
-    let ids: Vec<u32> = entries.iter().map(|p| p.0).collect();
-    let cs: Vec<u64> = entries.iter().map(|p| p.1).collect();
-    Stats::normalize(ids, &cs, t)
+    Stats::normalize_pairs(&entries, t)
 }
 
 pub fn decode_stream(
@@ -236,22 +235,18 @@ pub fn decode_stream(
             let mut order_counts = vec![1u64; n_slots];
             let mut ctx_counts: HashMap<u32, BTreeMap<u32, u64>> = HashMap::new();
             let mut ctx_totals: HashMap<u32, u64> = HashMap::new();
+            let mut ctx_tables = ContextTables::new(match_flag as usize);
             let mut pos = 0usize;
             while pos < num_lz {
                 let end = std::cmp::min(pos + chunk, num_lz);
                 let total: u64 = order_counts.iter().sum();
                 let o0 = norm_all(&order_counts, total)?;
-                let mut tables: HashMap<u32, Stats> = HashMap::new();
-                for (ctx, counts) in &ctx_counts {
-                    let t = ctx_totals[ctx];
-                    if t < MIN_CONTEXT_TRANSITIONS {
-                        continue;
-                    }
-                    tables.insert(*ctx, ppm_table(counts, t, escape_slot, false)?);
-                }
+                let tables = ctx_tables.advance(&ctx_counts, &ctx_totals, |counts, t| {
+                    ppm_table(counts, t, escape_slot, false)
+                })?;
                 for _ in pos..end {
                     let prev = lz.last().copied();
-                    let ctx = prev.and_then(|p| tables.get(&p));
+                    let ctx = prev.and_then(|p| tables.get(&p)).map(|r| r.as_ref());
                     let local = match ctx {
                         Some(ct) => {
                             let l = dec.decode_symbol(ct)?;
@@ -275,6 +270,7 @@ pub fn decode_stream(
                     if let Some(p) = prev {
                         *ctx_counts.entry(p).or_default().entry(local).or_insert(0) += 1;
                         *ctx_totals.entry(p).or_insert(0) += 1;
+                        ctx_tables.mark(p);
                     }
                 }
                 pos = end;
@@ -385,10 +381,11 @@ pub fn decode_stream(
             let mut order_counts = vec![1u64; k as usize + 1];
             let mut ctx_counts: HashMap<u32, BTreeMap<u32, u64>> = HashMap::new();
             let mut ctx_totals: HashMap<u32, u64> = HashMap::new();
+            let mut ctx_tables = ContextTables::new(k as usize + 1);
             let mut lit_pos = 0usize;
             let mut next_boundary = 0usize;
             let mut o0 = Stats::default();
-            let mut tables: HashMap<u32, Stats> = HashMap::new();
+            let mut tables: HashMap<u32, Rc<Stats>> = HashMap::new();
             let mut prev_lit: Option<u32> = None;
             for _ in 0..num_events {
                 if dec.decode_symbol(&role)? == 1 {
@@ -400,17 +397,12 @@ pub fn decode_stream(
                     if lit_pos == next_boundary {
                         let total: u64 = order_counts.iter().sum();
                         o0 = norm_all(&order_counts, total)?;
-                        tables.clear();
-                        for (ctx, counts) in &ctx_counts {
-                            let t = ctx_totals[ctx];
-                            if t < MIN_CONTEXT_TRANSITIONS {
-                                continue;
-                            }
-                            tables.insert(*ctx, ppm_table(counts, t, k, true)?);
-                        }
+                        tables = ctx_tables.advance(&ctx_counts, &ctx_totals, |counts, t| {
+                            ppm_table(counts, t, k, true)
+                        })?;
                         next_boundary = std::cmp::min(lit_pos + chunk, n_lit);
                     }
-                    let ctx = prev_lit.and_then(|p| tables.get(&p));
+                    let ctx = prev_lit.and_then(|p| tables.get(&p)).map(|r| r.as_ref());
                     let local = match ctx {
                         Some(ct) => {
                             let l = dec.decode_symbol(ct)?;
@@ -426,6 +418,7 @@ pub fn decode_stream(
                     if let Some(p) = prev_lit {
                         *ctx_counts.entry(p).or_default().entry(local).or_insert(0) += 1;
                         *ctx_totals.entry(p).or_insert(0) += 1;
+                        ctx_tables.mark(p);
                     }
                     prev_lit = Some(local);
                     lit_pos += 1;
@@ -446,7 +439,7 @@ pub fn decode_stream(
             let d = dict.ok_or_else(|| {
                 "TokPress stream was compressed with a TokDict dictionary (MODE_RANS_DICT), but no dictionary was supplied to this decoder".to_string()
             })?;
-            if fp[..] != d.fingerprint[..] {
+            if fp.as_slice() != d.fingerprint.as_slice() {
                 return Err("TokPress stream's TokDict fingerprint does not match the loaded dictionary -- wrong dictionary file for this stream".to_string());
             }
             let mut esc = Esc {

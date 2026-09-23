@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tokpress"
-version = "0.1.1"
+version = "0.2.0"
 description = "A tiktoken-tokenizer-driven, rANS-entropy-coded lossless compressor with a Rust core and a pure-Python fallback."
 readme = "README.md"
 license = "Apache-2.0"

@@ -118,6 +118,16 @@ class TokPressEncoder:
             return self._finish(payload, raw_bytes, integrity)
         lz_tokens = self._lz.encode(tokens, [])
 
+        if force_mode is not None:
+            # Build only the requested candidate: force_mode (`--fast`) is meant
+            # to skip the min-gate's other candidates, not build them and throw
+            # them away. Mirrors the Rust core's compress_tokens short-circuit.
+            return self._finish(
+                self._encode_forced_mode(force_mode, tokens, lz_tokens, n_raw, bits_per_symbol),
+                raw_bytes,
+                integrity,
+            )
+
         candidates: dict[int, bytes] = {
             MODE_RAW_TOKENS: self._encode_raw_tokens(lz_tokens, n_raw, bits_per_symbol),
             MODE_RANS_SPARSE: self._encode_rans_sparse(lz_tokens, n_raw),
@@ -144,14 +154,37 @@ class TokPressEncoder:
             dict_lz_tokens = self._lz.encode(tokens, self.dictionary.priming_tokens)
             candidates[MODE_RANS_DICT] = self._encode_rans_dict(dict_lz_tokens, n_raw)
 
-        if force_mode is not None:
-            if force_mode not in candidates:
-                raise ValueError(f"mode {force_mode} was not built for this record")
-            payload = candidates[force_mode]
-        else:
-            payload = min(candidates.values(), key=len)
+        payload = min(candidates.values(), key=len)
 
         return self._finish(payload, raw_bytes, integrity)
+
+    def _encode_forced_mode(
+        self, mode: int, tokens: list[int], lz_tokens: list[int], n_raw: int, bits_per_symbol: int
+    ) -> bytes:
+        """Build exactly one candidate mode for `force_mode`, raising the same
+        "was not built" ValueError the min-gate would for a mode this record
+        cannot produce (a short record's adaptive/PPM modes, or dict mode
+        without a dictionary)."""
+        if mode == MODE_RAW_TOKENS:
+            return self._encode_raw_tokens(lz_tokens, n_raw, bits_per_symbol)
+        if mode == MODE_RANS_SPARSE:
+            return self._encode_rans_sparse(lz_tokens, n_raw)
+        if mode == MODE_RANS_SPLIT:
+            return self._encode_rans_split(lz_tokens, n_raw)
+        if mode == MODE_RANS_ADAPTIVE_SPLIT:
+            return self._encode_rans_adaptive_split(lz_tokens, n_raw)
+        if mode in (MODE_RANS_ADAPTIVE, MODE_RANS_PPM, MODE_RANS_PPM_SPLIT):
+            if len(lz_tokens) < ADAPTIVE_MIN_SYMBOLS:
+                raise ValueError(f"mode {mode} was not built for this record")
+            if mode == MODE_RANS_ADAPTIVE:
+                return self._encode_rans_adaptive(lz_tokens, n_raw)
+            if mode == MODE_RANS_PPM:
+                return self._encode_rans_ppm(lz_tokens, n_raw)
+            return self._encode_rans_ppm_split(lz_tokens, n_raw)
+        if mode == MODE_RANS_DICT and self.dictionary is not None:
+            dict_lz_tokens = self._lz.encode(tokens, self.dictionary.priming_tokens)
+            return self._encode_rans_dict(dict_lz_tokens, n_raw)
+        raise ValueError(f"mode {mode} was not built for this record")
 
     def _finish(self, payload: bytes, raw_bytes: bytes, integrity: bool) -> bytes:
         # Flag bits + trailing payloads are applied to the winning stream only,

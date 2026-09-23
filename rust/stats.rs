@@ -13,6 +13,53 @@ pub struct Stats {
     dense: bool,
 }
 
+/// Scale `distinct` raw counts (read via `count_at`) so they sum to RANS_M,
+/// distributing rounding drift round-robin exactly like the Python reference.
+fn scale_freq<F: Fn(usize) -> u64>(
+    freq: &mut Vec<u32>,
+    distinct: usize,
+    total_symbols: u64,
+    count_at: F,
+) -> Result<(), String> {
+    if distinct > RANS_M as usize {
+        return Err(format!(
+            "{} distinct symbols exceeds RANS_M={}: every active symbol needs freq >= 1, so their \
+             frequencies can never be rebalanced down to sum to RANS_M.",
+            distinct, RANS_M
+        ));
+    }
+    let target = RANS_M as u64;
+    let max_allowed = target - 1;
+    let mut current_sum: u64 = 0;
+    for i in 0..distinct {
+        let mut f = count_at(i) * target / total_symbols;
+        if f == 0 {
+            f = 1;
+        } else if f > max_allowed {
+            f = max_allowed;
+        }
+        freq.push(f as u32);
+        current_sum += f;
+    }
+    if current_sum != target {
+        let true_ceiling = target - (distinct as u64 - 1);
+        let mut diff = target as i64 - current_sum as i64;
+        let mut cursor = 0usize;
+        while diff != 0 {
+            let i = cursor % distinct;
+            if diff > 0 && (freq[i] as u64) < true_ceiling {
+                freq[i] += 1;
+                diff -= 1;
+            } else if diff < 0 && freq[i] > 1 {
+                freq[i] -= 1;
+                diff += 1;
+            }
+            cursor += 1;
+        }
+    }
+    Ok(())
+}
+
 impl Stats {
     pub fn from_active_freq(active: Vec<u32>, freq: Vec<u32>) -> Stats {
         let mut cum = Vec::with_capacity(freq.len());
@@ -71,47 +118,23 @@ impl Stats {
             return Ok(Stats::default());
         }
         let distinct = active.len();
-        if distinct > RANS_M as usize {
-            return Err(format!(
-                "{} distinct symbols exceeds RANS_M={}: every active symbol needs freq >= 1, so their \
-                 frequencies can never be rebalanced down to sum to RANS_M.",
-                distinct, RANS_M
-            ));
-        }
-        let target = RANS_M as u64;
-        let max_allowed = target - 1;
         let mut freq = Vec::with_capacity(distinct);
-        let mut current_sum: u64 = 0;
-        for &c in counts.iter().take(distinct) {
-            let mut f = c * target / total_symbols;
-            if f == 0 {
-                f = 1;
-            } else if f > max_allowed {
-                f = max_allowed;
-            }
-            freq.push(f);
-            current_sum += f;
+        scale_freq(&mut freq, distinct, total_symbols, |i| counts[i])?;
+        Ok(Stats::from_active_freq(active, freq))
+    }
+
+    /// `normalize` over ascending `(symbol, count)` pairs, avoiding the
+    /// parallel `counts`/`active` copies the caller would otherwise build
+    /// (used by the PPM per-context tables).
+    pub fn normalize_pairs(pairs: &[(u32, u64)], total_symbols: u64) -> Result<Stats, String> {
+        if total_symbols == 0 || pairs.is_empty() {
+            return Ok(Stats::default());
         }
-        if current_sum != target {
-            let true_ceiling = target - (distinct as u64 - 1);
-            let mut diff = target as i64 - current_sum as i64;
-            let mut cursor = 0usize;
-            while diff != 0 {
-                let i = cursor % distinct;
-                if diff > 0 && freq[i] < true_ceiling {
-                    freq[i] += 1;
-                    diff -= 1;
-                } else if diff < 0 && freq[i] > 1 {
-                    freq[i] -= 1;
-                    diff += 1;
-                }
-                cursor += 1;
-            }
-        }
-        Ok(Stats::from_active_freq(
-            active,
-            freq.into_iter().map(|f| f as u32).collect(),
-        ))
+        let distinct = pairs.len();
+        let mut freq = Vec::with_capacity(distinct);
+        scale_freq(&mut freq, distinct, total_symbols, |i| pairs[i].1)?;
+        let active: Vec<u32> = pairs.iter().map(|p| p.0).collect();
+        Ok(Stats::from_active_freq(active, freq))
     }
 
     /// Normalise a dense count array (`counts[i]` for symbol i).

@@ -6,6 +6,7 @@ use crate::lz;
 use crate::rans::RansEncoder;
 use crate::stats::{Stats, RANS_M, RANS_M_BITS};
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 pub const MODE_RAW_TOKENS: u8 = 0;
 pub const MODE_RANS_SPARSE: u8 = 1;
@@ -338,8 +339,17 @@ fn capped_alphabet(lz: &[u32]) -> (Vec<u32>, bool) {
 }
 
 pub fn encode_adaptive(lz: &[u32], n_raw: u32) -> Result<Vec<u8>, String> {
-    let n = lz.len();
     let (active, has_escape) = capped_alphabet(lz);
+    encode_adaptive_with(lz, n_raw, active, has_escape)
+}
+
+fn encode_adaptive_with(
+    lz: &[u32],
+    n_raw: u32,
+    active: Vec<u32>,
+    has_escape: bool,
+) -> Result<Vec<u8>, String> {
+    let n = lz.len();
     let escape_local = active.len() as u32;
     let k = active.len() + if has_escape { 1 } else { 0 };
     let mut coded = Vec::with_capacity(n);
@@ -383,11 +393,88 @@ pub fn encode_adaptive(lz: &[u32], n_raw: u32) -> Result<Vec<u8>, String> {
     Ok(w.finish())
 }
 
-type CtxCounts = HashMap<u32, BTreeMap<u32, u64>>;
+pub(crate) type CtxCounts = HashMap<u32, BTreeMap<u32, u64>>;
+
+/// Incrementally maintained per-chunk context tables. A context table only
+/// changes when that context's monotonically growing counts change, so at each
+/// chunk boundary only the contexts touched since the previous boundary need
+/// rebuilding; every other table is reused by `Rc`. This yields exactly the
+/// tables a full rebuild-every-chunk would produce, but skips most of the
+/// (dominant) table-construction work: the number of rebuilt tables drops from
+/// n_chunks * eligible_contexts to ~the number of distinct (context, chunk)
+/// touch events. Shared by the PPM encoder and decoder.
+pub(crate) struct ContextTables {
+    current: HashMap<u32, Rc<Stats>>,
+    dirty: Vec<u32>,
+    stamp: Vec<u32>,
+    generation: u32,
+}
+
+impl ContextTables {
+    /// `max_key` is the largest context key that can occur (so `stamp` can be a
+    /// plain array rather than a map, keeping the per-token `mark` cheap).
+    pub(crate) fn new(max_key: usize) -> Self {
+        ContextTables {
+            current: HashMap::new(),
+            dirty: Vec::new(),
+            stamp: vec![u32::MAX; max_key + 1],
+            generation: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn mark(&mut self, ctx: u32) {
+        let i = ctx as usize;
+        if i >= self.stamp.len() {
+            // Out-of-range only for a corrupt stream whose escape value exceeds
+            // the symbol range the decoder sized `stamp` for; skipping keeps a
+            // malformed input from panicking. Valid streams never hit this.
+            return;
+        }
+        if self.stamp[i] != self.generation {
+            self.stamp[i] = self.generation;
+            self.dirty.push(ctx);
+        }
+    }
+
+    /// Rebuild the dirty/eligible tables with `build`, then return a snapshot
+    /// for the coming chunk (cheap `Rc` clones) and start a new generation.
+    pub(crate) fn advance<F>(
+        &mut self,
+        counts: &CtxCounts,
+        totals: &HashMap<u32, u64>,
+        mut build: F,
+    ) -> Result<HashMap<u32, Rc<Stats>>, String>
+    where
+        F: FnMut(&BTreeMap<u32, u64>, u64) -> Result<Stats, String>,
+    {
+        for &ctx in &self.dirty {
+            let (Some(c), Some(&t)) = (counts.get(&ctx), totals.get(&ctx)) else {
+                continue;
+            };
+            if t < MIN_CONTEXT_TRANSITIONS {
+                continue;
+            }
+            self.current.insert(ctx, Rc::new(build(c, t)?));
+        }
+        self.dirty.clear();
+        self.generation = self.generation.wrapping_add(1);
+        Ok(self.current.clone())
+    }
+}
 
 pub fn encode_ppm(lz: &[u32], n_raw: u32) -> Result<Vec<u8>, String> {
-    let n = lz.len();
     let (active, has_escape) = capped_alphabet(lz);
+    encode_ppm_with(lz, n_raw, active, has_escape)
+}
+
+fn encode_ppm_with(
+    lz: &[u32],
+    n_raw: u32,
+    active: Vec<u32>,
+    has_escape: bool,
+) -> Result<Vec<u8>, String> {
+    let n = lz.len();
     let order0_escape = active.len() as u32;
     let n_slots = active.len() + if has_escape { 1 } else { 0 };
     let chunk_size = adaptive_chunk_size(n, n_slots);
@@ -399,25 +486,19 @@ pub fn encode_ppm(lz: &[u32], n_raw: u32) -> Result<Vec<u8>, String> {
     let n_chunks = if n == 0 { 0 } else { n.div_ceil(chunk_size) };
     let all0: Vec<u32> = (0..n_slots as u32).collect();
 
+    let max_ctx = lz.iter().copied().max().unwrap_or(0) as usize;
+    let mut ctx_tables = ContextTables::new(max_ctx);
     let mut chunk_order: Vec<Stats> = Vec::with_capacity(n_chunks);
-    let mut chunk_ctx: Vec<HashMap<u32, Stats>> = Vec::with_capacity(n_chunks);
+    let mut chunk_ctx: Vec<HashMap<u32, Rc<Stats>>> = Vec::with_capacity(n_chunks);
     for c in 0..n_chunks {
         let total: u64 = order_counts.iter().sum();
         chunk_order.push(Stats::normalize(all0.clone(), &order_counts, total)?);
-        let mut tables: HashMap<u32, Stats> = HashMap::new();
-        for (ctx, counts) in &ctx_counts {
-            let t = ctx_totals[ctx];
-            if t < MIN_CONTEXT_TRANSITIONS {
-                continue;
-            }
+        chunk_ctx.push(ctx_tables.advance(&ctx_counts, &ctx_totals, |counts, t| {
             let esc_mass = std::cmp::max(1, counts.len() as u64);
             let mut entries: Vec<(u32, u64)> = counts.iter().map(|(&l, &c)| (l, c)).collect();
             entries.push((order0_escape, esc_mass));
-            let active_ids: Vec<u32> = entries.iter().map(|p| p.0).collect();
-            let cs: Vec<u64> = entries.iter().map(|p| p.1).collect();
-            tables.insert(*ctx, Stats::normalize(active_ids, &cs, t + esc_mass)?);
-        }
-        chunk_ctx.push(tables);
+            Stats::normalize_pairs(&entries, t + esc_mass)
+        })?);
         for j in c * chunk_size..std::cmp::min((c + 1) * chunk_size, n) {
             let Some(local) = local_of(lz[j]) else {
                 continue;
@@ -431,6 +512,7 @@ pub fn encode_ppm(lz: &[u32], n_raw: u32) -> Result<Vec<u8>, String> {
                     .entry(local)
                     .or_insert(0) += 1;
                 *ctx_totals.entry(prev).or_insert(0) += 1;
+                ctx_tables.mark(prev);
             }
         }
     }
@@ -445,7 +527,11 @@ pub fn encode_ppm(lz: &[u32], n_raw: u32) -> Result<Vec<u8>, String> {
         for j in (lo..hi).rev() {
             let sym = lz[j];
             let local = local_of(sym);
-            let ctx = if j > 0 { tables.get(&lz[j - 1]) } else { None };
+            let ctx: Option<&Stats> = if j > 0 {
+                tables.get(&lz[j - 1]).map(|r| r.as_ref())
+            } else {
+                None
+            };
             if let (Some(ct), Some(l)) = (ctx, local) {
                 if ct.has(l) {
                     enc.encode_symbol(l, ct);
@@ -498,17 +584,13 @@ pub fn encode_ppm_split(lz: &[u32], n_raw: u32, match_flag: u32) -> Result<Vec<u
     };
     let all0: Vec<u32> = (0..=k).collect();
 
+    let mut ctx_tables = ContextTables::new(k as usize + 1);
     let mut chunk_order: Vec<Stats> = Vec::with_capacity(n_chunks);
-    let mut chunk_ctx: Vec<HashMap<u32, Stats>> = Vec::with_capacity(n_chunks);
+    let mut chunk_ctx: Vec<HashMap<u32, Rc<Stats>>> = Vec::with_capacity(n_chunks);
     for c in 0..n_chunks {
         let total: u64 = order_counts.iter().sum();
         chunk_order.push(Stats::normalize(all0.clone(), &order_counts, total)?);
-        let mut tables: HashMap<u32, Stats> = HashMap::new();
-        for (ctx, counts) in &ctx_counts {
-            let t = ctx_totals[ctx];
-            if t < MIN_CONTEXT_TRANSITIONS {
-                continue;
-            }
+        chunk_ctx.push(ctx_tables.advance(&ctx_counts, &ctx_totals, |counts, t| {
             let esc_mass = std::cmp::max(1, counts.len() as u64);
             // Real locals 0..k-1 keep their counts; slot k (ctx escape) and k+1
             // (local escape) are overwritten, matching the reference quirk.
@@ -519,11 +601,8 @@ pub fn encode_ppm_split(lz: &[u32], n_raw: u32, match_flag: u32) -> Result<Vec<u
                 .collect();
             entries.push((k, esc_mass));
             entries.push((k + 1, 1));
-            let active_ids: Vec<u32> = entries.iter().map(|p| p.0).collect();
-            let cs: Vec<u64> = entries.iter().map(|p| p.1).collect();
-            tables.insert(*ctx, Stats::normalize(active_ids, &cs, t + esc_mass + 1)?);
-        }
-        chunk_ctx.push(tables);
+            Stats::normalize_pairs(&entries, t + esc_mass + 1)
+        })?);
         for j in c * chunk_size..std::cmp::min((c + 1) * chunk_size, n_lit) {
             let local = coded[j];
             order_counts[local as usize] += 1;
@@ -535,6 +614,7 @@ pub fn encode_ppm_split(lz: &[u32], n_raw: u32, match_flag: u32) -> Result<Vec<u
                     .entry(local)
                     .or_insert(0) += 1;
                 *ctx_totals.entry(prev).or_insert(0) += 1;
+                ctx_tables.mark(prev);
             }
         }
     }
@@ -549,8 +629,8 @@ pub fn encode_ppm_split(lz: &[u32], n_raw: u32, match_flag: u32) -> Result<Vec<u
             let local = coded[lit_idx];
             let c = lit_idx / chunk_size;
             let o0 = &chunk_order[c];
-            let ctx = if lit_idx > 0 {
-                chunk_ctx[c].get(&coded[lit_idx - 1])
+            let ctx: Option<&Stats> = if lit_idx > 0 {
+                chunk_ctx[c].get(&coded[lit_idx - 1]).map(|r| r.as_ref())
             } else {
                 None
             };
@@ -623,8 +703,47 @@ pub fn encode_dict(lz: &[u32], n_raw: u32, d: &DictData) -> Vec<u8> {
     w.finish()
 }
 
+/// Build exactly one mode's payload, or Err when that mode would not be built
+/// for this record (short record, or dict mode with no dictionary). Used by
+/// `force_mode` so it skips building the candidates it is going to discard.
+fn encode_one(
+    mode: u8,
+    tokens: &[u32],
+    lz: &[u32],
+    n_raw: u32,
+    match_flag: u32,
+    bits: u32,
+    dict: Option<&DictData>,
+) -> Result<Vec<u8>, String> {
+    match mode {
+        MODE_RAW_TOKENS => Ok(encode_raw(lz, n_raw, bits)),
+        MODE_RANS_SPARSE => encode_sparse(lz, n_raw, match_flag),
+        MODE_RANS_SPLIT => encode_split(lz, n_raw, match_flag),
+        MODE_RANS_ADAPTIVE_SPLIT => encode_adaptive_split(lz, n_raw, match_flag),
+        MODE_RANS_ADAPTIVE | MODE_RANS_PPM | MODE_RANS_PPM_SPLIT => {
+            if lz.len() < ADAPTIVE_MIN_SYMBOLS {
+                return Err(format!("mode {} was not built for this record", mode));
+            }
+            match mode {
+                MODE_RANS_ADAPTIVE => encode_adaptive(lz, n_raw),
+                MODE_RANS_PPM => encode_ppm(lz, n_raw),
+                _ => encode_ppm_split(lz, n_raw, match_flag),
+            }
+        }
+        MODE_RANS_DICT => match dict {
+            Some(d) => {
+                let dlz = lz::encode(tokens, &d.priming, match_flag);
+                Ok(encode_dict(&dlz, n_raw, d))
+            }
+            None => Err(format!("mode {} was not built for this record", mode)),
+        },
+        m => Err(format!("mode {} was not built for this record", m)),
+    }
+}
+
 /// Build every applicable candidate in the reference order and return the
-/// smallest (first on ties), or the forced mode's payload.
+/// smallest (first on ties), or -- when `force_mode` is set -- build and
+/// return only that one candidate's payload.
 pub fn compress_tokens(
     tokens: &[u32],
     n_raw: u32,
@@ -634,6 +753,9 @@ pub fn compress_tokens(
     force_mode: Option<u8>,
 ) -> Result<Vec<u8>, String> {
     let lz = lz::encode(tokens, &[], match_flag);
+    if let Some(fm) = force_mode {
+        return encode_one(fm, tokens, &lz, n_raw, match_flag, bits, dict);
+    }
     let mut cands: Vec<(u8, Vec<u8>)> = vec![
         (MODE_RAW_TOKENS, encode_raw(&lz, n_raw, bits)),
         (MODE_RANS_SPARSE, encode_sparse(&lz, n_raw, match_flag)?),
@@ -644,8 +766,17 @@ pub fn compress_tokens(
         encode_adaptive_split(&lz, n_raw, match_flag)?,
     ));
     if lz.len() >= ADAPTIVE_MIN_SYMBOLS {
-        cands.push((MODE_RANS_ADAPTIVE, encode_adaptive(&lz, n_raw)?));
-        cands.push((MODE_RANS_PPM, encode_ppm(&lz, n_raw)?));
+        // Adaptive and PPM share the same capped alphabet; count it once instead
+        // of re-sorting the whole stream inside each encoder.
+        let (active, has_escape) = capped_alphabet(&lz);
+        cands.push((
+            MODE_RANS_ADAPTIVE,
+            encode_adaptive_with(&lz, n_raw, active.clone(), has_escape)?,
+        ));
+        cands.push((
+            MODE_RANS_PPM,
+            encode_ppm_with(&lz, n_raw, active, has_escape)?,
+        ));
         cands.push((
             MODE_RANS_PPM_SPLIT,
             encode_ppm_split(&lz, n_raw, match_flag)?,
@@ -654,13 +785,6 @@ pub fn compress_tokens(
     if let Some(d) = dict {
         let dlz = lz::encode(tokens, &d.priming, match_flag);
         cands.push((MODE_RANS_DICT, encode_dict(&dlz, n_raw, d)));
-    }
-    if let Some(fm) = force_mode {
-        return cands
-            .into_iter()
-            .find(|c| c.0 == fm)
-            .map(|c| c.1)
-            .ok_or_else(|| format!("mode {} was not built for this record", fm));
     }
     let mut best = 0usize;
     for (i, c) in cands.iter().enumerate() {

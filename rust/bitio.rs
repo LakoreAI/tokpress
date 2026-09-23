@@ -97,6 +97,9 @@ impl<'a> BitReader<'a> {
     }
 
     pub fn read_bits(&mut self, count: u32) -> Result<u64, String> {
+        if count > 64 {
+            return Err(format!("invalid read width {} (max 64 bits)", count));
+        }
         while self.bit_count < count && self.byte_pos < self.data.len() {
             self.bit_buf |= (self.data[self.byte_pos] as u128) << self.bit_count;
             self.bit_count += 8;
