@@ -14,7 +14,7 @@ basis.
 > semantically coherent pieces, tokenizing before LZ77 + entropy coding gives
 > the compressor a better-shaped alphabet than raw bytes. On the workload it is
 > designed for — many small JSON-style records compressed with a shared trained
-> dictionary — it reaches **0.2554** (per record) and **0.2309** (batch), which
+> dictionary — it reaches **0.2537** (per record) and **0.2256** (batch), which
 > beats every dictionary-less baseline and closes most of the gap to `zstd`
 > with a matched dictionary (0.1371). It is pure Python, Apache-2.0, and needs
 > only one runtime dependency (`tiktoken`).
@@ -106,12 +106,12 @@ neural network at compress time).
 | **Tokenizer** | tiktoken `o200k_base` (or a custom trained vocabulary) |
 | **Entropy coding** | rANS (asymmetric numeral systems) over LZ77 match tuples |
 | **Target workload** | Many small, schema-homogeneous records (JSON logs, telemetry, API/package metadata) |
-| **Python API** | `compress` / `decompress` / `compress_many` / `decompress_many` / `TokDict.train` / `tokenize_stats` |
+| **Python API** | `compress` / `decompress` / `compress_many` / `decompress_many` / `iter_decompress_many` / `TokDict.train` / `tokenize_stats` |
 | **CLI** | `tokpress compress|decompress|pack|unpack|read|bench|tokenize-stats|train-dict|train-vocab|fit` |
 | **Language** | Pure Python (3.10+) |
 | **Dependencies** | `tiktoken` only |
 | **License** | Apache-2.0 |
-| **Verification** | 115 tests + a deterministic ratio-regression gate in CI |
+| **Verification** | 124 tests + a deterministic ratio-regression gate in CI |
 
 ---
 
@@ -261,13 +261,14 @@ Correctness-first trainer — use the `--max-bytes` cap to sample the corpus
 
 On real held-out JSON log records (`scripts/bench.py`'s trained-dictionary
 regime), with a `TokDict` trained on a disjoint training split (paper-scale
-split, 46 held-out records; repeated-seeded-split means are ~0.254 / 0.226):
+split, 46 held-out records; default `cover` priming picker; repeated-seeded
+5-split means are ~0.254 / 0.232):
 
 | backend | ratio (held-out records) |
 |---|---|
 | per-record, no dictionary | 0.8078 |
-| per-record + `TokDict` | 0.2554 |
-| **batch (`compress_many`) + `TokDict`** | **0.2309** |
+| per-record + `TokDict` | 0.2537 |
+| **batch (`compress_many`) + `TokDict`** | **0.2256** |
 | `zstd -19` + matched dict, batch (blob) | 0.1371 |
 
 TokPress beats every dictionary-less baseline and most of the gap to zstd's
@@ -310,7 +311,8 @@ Whole-file, no dictionary:
 | **`o200k_base` (default)** | 200,019 | 0.2976 | 0.3362 | 0.1979 |
 | `p50k_base` / `r50k_base` / `gpt2` | ~50k | 0.3090–0.3109 | 0.3542–0.3640 | 0.2035 |
 
-Trained-`TokDict` regime (json_heldout, 184 train / 46 held-out records):
+Trained-`TokDict` regime (json_heldout, 184 train / 46 held-out records),
+measured under the earlier `concat` priming default so every row is comparable:
 
 | encoding | per no-dict | per + `TokDict` | batch + `TokDict` |
 |---|---|---|---|
@@ -326,6 +328,8 @@ compression only, and the ~50k-vocab encodings lose everywhere it matters. A
 small vocabulary wins in exactly one niche — independent per-record
 compression with no dictionary — where it merely shrinks the per-record header.
 Single-split/single-file measurements; deltas under ~1% are near split noise.
+Under the current `cover` default the `o200k_base` row improves to 0.2537
+per-record / 0.2256 batch (the other encodings were not re-measured).
 
 ---
 
@@ -362,7 +366,7 @@ pip install -e .
 pytest tests/
 ```
 
-The suite (115 tests) covers bitstream and rANS roundtrips (incl. the
+The suite (124 tests) covers bitstream and rANS roundtrips (incl. the
 single-symbol-alphabet edge case), token-level LZ77 roundtrip, the tiktoken
 adapter's byte-exact roundtrip on arbitrary binary input (including invalid
 UTF-8), full codec roundtrips across payload shapes, `TokDict`
@@ -417,7 +421,7 @@ whole batch.
 
 **How does TokPress compare to `zstd` with a trained dictionary?**
 Honestly: zstd still wins. On the paper-scale held-out JSON records, per-record
-`tokpress+dict` is 0.2554 and batch is 0.2309, vs 0.1371 for zstd-19 with a
+`tokpress+dict` is 0.2537 and batch is 0.2256, vs 0.1371 for zstd-19 with a
 matched dictionary compressed as a blob. zstd's COVER/FastCover dictionary
 training and FSE tables are more mature. TokPress's result is that it beats
 every *dictionary-less* baseline, and its `.tokdict` + batch mode is an open,
@@ -437,7 +441,7 @@ domain-trained vocabulary (byte-BPE or SentencePiece) wins, purely by cutting
 the per-record header/alphabet cost (0.162 vs 0.178 on the trained-vocab corpus;
 0.64 vs 0.81 on json_heldout's held-out records). When a trained `TokDict`
 supplies the domain structure, the positions reverse — `o200k_base` wins
-(0.2554 vs 0.31–0.44 for 4k–16k domain vocabs) because the dictionary amortizes
+(0.2537 vs 0.31–0.44 for 4k–16k domain vocabs) because the dictionary amortizes
 the alphabet and the larger, better-tuned merge stream then dominates. So:
 train a vocabulary for dictionary-less per-record work; keep `o200k_base` when
 you are already training a `TokDict`.
@@ -447,7 +451,9 @@ you are already training a `TokDict`.
 Measured head-to-head, `cl100k_base` is a hair better only on whole-file,
 no-dictionary compression (~0.5% smaller on prose/code/JSON), while
 `o200k_base` wins the trained-dictionary regime (per-record+dict 0.2554 vs
-0.2717, batch+dict 0.2309 vs 0.2311). The ~50k-vocab encodings
+0.2717, batch+dict 0.2309 vs 0.2311; both measured under the earlier `concat`
+default — the `o200k_base` side is 0.2537 / 0.2256 under the current `cover`
+default, while `cl100k_base` was not re-measured). The ~50k-vocab encodings
 (`p50k_base`/`r50k_base`/`gpt2`) lose in both regimes. Keep the default unless
 your workload is exclusively whole-file compression with no dictionary — then
 `cl100k_base` is a measured, if small, win.

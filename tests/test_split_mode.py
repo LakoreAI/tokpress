@@ -57,11 +57,11 @@ def test_split_mode_roundtrips_on_diverse_payload_with_escapes():
     lz_tokens = list(range(n_distinct)) + [5, 5, 5, 10, 10]
     assert len(set(lz_tokens)) > RANS_M  # sanity: forces the literal escape path
 
-    compressed = enc._encode_rans_split(lz_tokens, n_raw=len(lz_tokens))
-    assert compressed[5] == MODE_RANS_SPLIT
-
     expected_tokens = dec._lz.decode(lz_tokens, [])
     expected_bytes = dec.tokenizer.decode(expected_tokens)
+
+    compressed = enc._encode_rans_split(lz_tokens, n_raw=len(expected_bytes))
+    assert compressed[5] == MODE_RANS_SPLIT
     assert dec.decompress(compressed) == expected_bytes
 
 
@@ -115,9 +115,9 @@ def test_adaptive_split_roundtrips_with_literal_escape():
     lz_tokens = list(range(n_distinct)) + [5, 5, 5, 10, 10]
     assert len(set(lz_tokens)) > RANS_M
 
-    compressed = enc._encode_rans_adaptive_split(lz_tokens, n_raw=len(lz_tokens))
-    assert compressed[5] == MODE_RANS_ADAPTIVE_SPLIT
-
     expected_tokens = dec._lz.decode(lz_tokens, [])
     expected_bytes = dec.tokenizer.decode(expected_tokens)
+
+    compressed = enc._encode_rans_adaptive_split(lz_tokens, n_raw=len(expected_bytes))
+    assert compressed[5] == MODE_RANS_ADAPTIVE_SPLIT
     assert dec.decompress(compressed) == expected_bytes

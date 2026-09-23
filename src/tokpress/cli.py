@@ -41,12 +41,12 @@ Options:
                           modes gate -- much less encoder work, a few percent
                           worse ratio, and not usable with --dict
   --priming-mode MODE     train-dict/fit: how the LZ priming buffer is built
-                          from the sample records -- "concat" (default, head-
-                          concatenation), "coverage" (frequent-token-mass
-                          record picker), "diverse" (marginal-coverage record
-                          picker), or "cover" (segment-level, zstd-COVER-style
-                          d-mer scoring; usually the best per-record picker,
-                          "concat" usually wins batch mode -- see README)
+                          from the sample records -- "cover" (default,
+                          segment-level zstd-COVER-style d-mer scoring; best
+                          or tied-best in a 25-split repeated measurement),
+                          "concat" (head-concatenation), "coverage"
+                          (frequent-token-mass record picker), or "diverse"
+                          (marginal-coverage record picker) -- see README
 
 Streams compressed with a custom --vocab always carry an 8-byte vocabulary
 fingerprint, so decompressing with the wrong vocab raises even without
@@ -267,7 +267,7 @@ def cmd_train_dict(args: list[str]) -> int:
     output_path = args[2]
     flags = _parse_flags(args, 3)
     sample_paths = _parse_positional(args, 3)
-    priming_mode = flags.get("priming_mode", "concat")
+    priming_mode = flags.get("priming_mode", "cover")
 
     samples = []
     for path in sample_paths:
@@ -339,17 +339,19 @@ def cmd_unpack(args: list[str]) -> int:
     with open(input_path, "rb") as f:
         compressed = f.read()
 
-    t0 = time.perf_counter()
-    records = core.decompress_many(compressed, dictionary=dictionary, tokenizer=tokenizer)
-    elapsed = time.perf_counter() - t0
-
+    n_records = core.batch_record_count(compressed)
     os.makedirs(out_dir, exist_ok=True)
-    width = max(4, len(str(len(records) - 1)))
-    for i, rec in enumerate(records):
+    width = max(4, len(str(n_records - 1))) if n_records else 4
+
+    t0 = time.perf_counter()
+    written = 0
+    for i, rec in enumerate(core.iter_decompress_many(compressed, dictionary=dictionary, tokenizer=tokenizer)):
         with open(os.path.join(out_dir, f"{i:0{width}d}.rec"), "wb") as f:
             f.write(rec)
+        written += 1
+    elapsed = time.perf_counter() - t0
 
-    print(f"Unpacked: {out_dir} ({len(records)} records)")
+    print(f"Unpacked: {out_dir} ({written} records)")
     print(f"  time:     {elapsed * 1000:.2f} ms")
     return 0
 
@@ -366,7 +368,7 @@ def cmd_fit(args: list[str]) -> int:
     max_bytes = 256 * 1024
     corpus_paths = _parse_positional(args, 3)
     flags = _parse_flags(args, 3)
-    priming_mode = flags.get("priming_mode", "concat")
+    priming_mode = flags.get("priming_mode", "cover")
     if "--vocab-size" in args or "--max-bytes" in args:
         i = 3
         while i < len(args):

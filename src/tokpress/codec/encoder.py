@@ -20,6 +20,7 @@ from ..tokenizer.tiktoken_adapter import TiktokenTokenizer
 from .token_lz import TokenLZMatch
 
 TOKZ_MAGIC = b"TOKZ"
+TOKZ_VERSION = 1
 
 MODE_RAW_TOKENS = 0
 MODE_RANS_SPARSE = 1
@@ -75,7 +76,7 @@ class TokPressEncoder:
     def _write_header(self, w: BitWriter, mode: int, n_raw: int) -> None:
         for b in TOKZ_MAGIC:
             w.write_byte(b)
-        w.write_byte(1)  # version
+        w.write_byte(TOKZ_VERSION)
         w.write_byte(mode)
         w.write_uint32(n_raw)
 
@@ -229,35 +230,12 @@ class TokPressEncoder:
         literal_alphabet_size = real_alphabet_size + 1
         n = len(lz_tokens)
 
-        positions: list[tuple[int, int]] = []  # (start_index, 1 for literal or 4 for match)
-        role_bits: list[int] = []
-        literals: list[int] = []
-        dist_hi_vals: list[int] = []
-        dist_lo_vals: list[int] = []
-        length_vals: list[int] = []
-        i = 0
-        while i < n:
-            if lz_tokens[i] == match_flag and i + 3 < n:
-                role_bits.append(1)
-                dist_hi_vals.append(lz_tokens[i + 1])
-                dist_lo_vals.append(lz_tokens[i + 2])
-                length_vals.append(lz_tokens[i + 3])
-                positions.append((i, 4))
-                i += 4
-            else:
-                role_bits.append(0)
-                literals.append(lz_tokens[i])
-                positions.append((i, 1))
-                i += 1
-
-        role_stats = SymbolStats(2)
-        role_stats.count_symbols(role_bits, build_decode_lut=False)
-        dist_hi_stats = SymbolStats(256)
-        dist_hi_stats.count_symbols(dist_hi_vals, build_decode_lut=False)
-        dist_lo_stats = SymbolStats(256)
-        dist_lo_stats.count_symbols(dist_lo_vals, build_decode_lut=False)
-        length_stats = SymbolStats(256)
-        length_stats.count_symbols(length_vals, build_decode_lut=False)
+        positions, role_bits, literals, dist_hi_vals, dist_lo_vals, length_vals = self._split_lz_events(
+            lz_tokens, match_flag
+        )
+        role_stats, dist_hi_stats, dist_lo_stats, length_stats = self._split_metadata_stats(
+            dist_hi_vals, dist_lo_vals, length_vals, role_bits
+        )
 
         raw_counts = [0] * literal_alphabet_size
         for sym in literals:
@@ -320,17 +298,15 @@ class TokPressEncoder:
         w.flush()
         return w.getvalue()
 
-    def _write_small_table(self, w: BitWriter, stats: SymbolStats) -> None:
-        active = sorted(stats.active)
-        write_symbol_list(w, active)
-        for sym_id in active:
-            w.write_bits(stats.freq[sym_id] - 1, RANS_M_BITS)  # freq-1: see _encode_rans_sparse
-
-    def _encode_rans_adaptive_split(self, lz_tokens: list[int], n_raw: int) -> bytes:
-        """Combines _encode_rans_split's match-metadata separation with _encode_rans_adaptive's zero-transmission-cost chunked history, applied to the literal sub-stream specifically (role/distance/length stay static small tables, since their alphabets are always tiny and there is little to gain from adaptivity there). Measured independently, match-metadata separation alone helps records where chunked-adaptive does not win, and vice versa; this mode lets both wins stack for records where they would otherwise trade off against each other via the min(candidates, key=len) selection."""
-        match_flag = self.tokenizer.match_flag
-        n = len(lz_tokens)
-
+    @staticmethod
+    def _split_lz_events(
+        lz_tokens: list[int], match_flag: int
+    ) -> tuple[list[tuple[int, int]], list[int], list[int], list[int], list[int], list[int]]:
+        """Parse an LZ-token stream into (positions, role_bits, literals,
+        dist_hi_vals, dist_lo_vals, length_vals). positions[k] is (start_index,
+        span) where span is 4 for a match tuple and 1 for a literal. Shared by
+        the three split/adaptive-split/PPM-split modes so their framing of the
+        stream cannot drift apart."""
         positions: list[tuple[int, int]] = []
         role_bits: list[int] = []
         literals: list[int] = []
@@ -338,6 +314,7 @@ class TokPressEncoder:
         dist_lo_vals: list[int] = []
         length_vals: list[int] = []
         i = 0
+        n = len(lz_tokens)
         while i < n:
             if lz_tokens[i] == match_flag and i + 3 < n:
                 role_bits.append(1)
@@ -351,7 +328,15 @@ class TokPressEncoder:
                 literals.append(lz_tokens[i])
                 positions.append((i, 1))
                 i += 1
+        return positions, role_bits, literals, dist_hi_vals, dist_lo_vals, length_vals
 
+    @staticmethod
+    def _split_metadata_stats(
+        dist_hi_vals: list[int], dist_lo_vals: list[int], length_vals: list[int], role_bits: list[int]
+    ) -> tuple[SymbolStats, SymbolStats, SymbolStats, SymbolStats]:
+        """Build the four small static tables shared by every split mode: the
+        literal-vs-match role bit, and the [0, 255] match distance-high,
+        distance-low, and length tables."""
         role_stats = SymbolStats(2)
         role_stats.count_symbols(role_bits, build_decode_lut=False)
         dist_hi_stats = SymbolStats(256)
@@ -360,6 +345,25 @@ class TokPressEncoder:
         dist_lo_stats.count_symbols(dist_lo_vals, build_decode_lut=False)
         length_stats = SymbolStats(256)
         length_stats.count_symbols(length_vals, build_decode_lut=False)
+        return role_stats, dist_hi_stats, dist_lo_stats, length_stats
+
+    def _write_small_table(self, w: BitWriter, stats: SymbolStats) -> None:
+        active = sorted(stats.active)
+        write_symbol_list(w, active)
+        for sym_id in active:
+            w.write_bits(stats.freq[sym_id] - 1, RANS_M_BITS)  # freq-1: see _encode_rans_sparse
+
+    def _encode_rans_adaptive_split(self, lz_tokens: list[int], n_raw: int) -> bytes:
+        """Combines _encode_rans_split's match-metadata separation with _encode_rans_adaptive's zero-transmission-cost chunked history, applied to the literal sub-stream specifically (role/distance/length stay static small tables, since their alphabets are always tiny and there is little to gain from adaptivity there). Measured independently, match-metadata separation alone helps records where chunked-adaptive does not win, and vice versa; this mode lets both wins stack for records where they would otherwise trade off against each other via the min(candidates, key=len) selection."""
+        match_flag = self.tokenizer.match_flag
+        n = len(lz_tokens)
+
+        positions, role_bits, literals, dist_hi_vals, dist_lo_vals, length_vals = self._split_lz_events(
+            lz_tokens, match_flag
+        )
+        role_stats, dist_hi_stats, dist_lo_stats, length_stats = self._split_metadata_stats(
+            dist_hi_vals, dist_lo_vals, length_vals, role_bits
+        )
 
         # Escape-capped LOCAL alphabet over literals only (usually far fewer
         # distinct values than the full lz_tokens stream, since match
@@ -611,35 +615,12 @@ class TokPressEncoder:
         match_flag = self.tokenizer.match_flag
         n = len(lz_tokens)
 
-        positions: list[tuple[int, int]] = []
-        role_bits: list[int] = []
-        literals: list[int] = []
-        dist_hi_vals: list[int] = []
-        dist_lo_vals: list[int] = []
-        length_vals: list[int] = []
-        i = 0
-        while i < n:
-            if lz_tokens[i] == match_flag and i + 3 < n:
-                role_bits.append(1)
-                dist_hi_vals.append(lz_tokens[i + 1])
-                dist_lo_vals.append(lz_tokens[i + 2])
-                length_vals.append(lz_tokens[i + 3])
-                positions.append((i, 4))
-                i += 4
-            else:
-                role_bits.append(0)
-                literals.append(lz_tokens[i])
-                positions.append((i, 1))
-                i += 1
-
-        role_stats = SymbolStats(2)
-        role_stats.count_symbols(role_bits, build_decode_lut=False)
-        dist_hi_stats = SymbolStats(256)
-        dist_hi_stats.count_symbols(dist_hi_vals, build_decode_lut=False)
-        dist_lo_stats = SymbolStats(256)
-        dist_lo_stats.count_symbols(dist_lo_vals, build_decode_lut=False)
-        length_stats = SymbolStats(256)
-        length_stats.count_symbols(length_vals, build_decode_lut=False)
+        positions, role_bits, literals, dist_hi_vals, dist_lo_vals, length_vals = self._split_lz_events(
+            lz_tokens, match_flag
+        )
+        role_stats, dist_hi_stats, dist_lo_stats, length_stats = self._split_metadata_stats(
+            dist_hi_vals, dist_lo_vals, length_vals, role_bits
+        )
 
         n_lit = len(literals)
         literal_counts: dict[int, int] = {}

@@ -1,5 +1,6 @@
 from .core import (
     IndexedBatchWriter,
+    batch_record_count,
     benchmark,
     compress,
     compress_file,
@@ -10,11 +11,12 @@ from .core import (
     indexed_compress,
     indexed_decompress,
     indexed_read,
+    iter_decompress_many,
     tokenize_stats,
 )
 from .dictionary import TokDict
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "compress",
@@ -23,6 +25,8 @@ __all__ = [
     "decompress_file",
     "compress_many",
     "decompress_many",
+    "iter_decompress_many",
+    "batch_record_count",
     "indexed_compress",
     "indexed_decompress",
     "indexed_read",

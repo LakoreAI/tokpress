@@ -455,3 +455,6 @@ docs/*.fls
 docs/*.fdb_latexmk
 
 *.md
+!README.md
+!AGENT.md
+!docs/*.md

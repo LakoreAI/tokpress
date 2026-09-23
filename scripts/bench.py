@@ -274,6 +274,90 @@ def run_many_small_records() -> None:
     run_trained_dictionary_regime(lines)
 
 
+def run_parmar_comparison() -> None:
+    """The headline question of docs/VISION.md Sec 2: does entropy-coding
+    tiktoken token ids *directly* (TokPress's LZ77 + rANS) beat piping the same
+    token ids through a byte-level compressor (parmar: tiktoken -> fixed-width
+    token ids -> xz/lzma)? parmar measured itself only on natural-language
+    corpora; this reports the code / JSON / logs / many-small-records regimes
+    it explicitly left untested, side by side, with the per-regime delta and
+    winner.
+
+    The many-small-records dictionary regime is TokPress-only here: a
+    token->byte pipeline has no shared-dictionary analogue. The byte-level
+    dictionary baseline (zstd -19 + trained dict) is measured in
+    `run_trained_dictionary_regime`.
+    """
+    if not DATA_ROOT.is_dir():
+        print(f"\n=== parmar comparison: SKIPPED (corpus root not found at {DATA_ROOT}) ===")
+        return
+
+    print("\n=== parmar comparison: tokens -> entropy-code directly vs tokens -> xz ===")
+    print(f"{'regime':<46} {'tokpress':>10} {'parmar(xz)':>12} {'delta':>10} {'winner':>10}")
+
+    wins = {"tokpress": 0, "parmar": 0}
+
+    def _compare(label: str, tp_size: int, pm_size: int, raw_size: int) -> None:
+        tp = tp_size / raw_size
+        pm = pm_size / raw_size
+        winner = "tokpress" if tp < pm else "parmar"
+        wins[winner] += 1
+        print(f"{label:<46} {tp:>10.4f} {pm:>12.4f} {tp - pm:>+10.4f} {winner:>10}")
+
+    for name, path in CORPORA.items():
+        if not path.is_file():
+            print(f"{name:<46} {'SKIPPED':>10} {'(corpus absent)':>12}")
+            continue
+        data = path.read_bytes()
+        _compare(name, len(backend_tokpress(data)), len(backend_parmar_style(data)), len(data))
+
+    if MANY_SMALL_RECORDS_PATH.is_file():
+        lines = [line for line in MANY_SMALL_RECORDS_PATH.read_bytes().split(b"\n") if line]
+        total = sum(len(line) for line in lines)
+        _compare(
+            f"many-small-records per-record ({len(lines)})",
+            sum(len(backend_tokpress(line)) for line in lines),
+            sum(len(backend_parmar_style(line)) for line in lines),
+            total,
+        )
+        blob = b"\n".join(lines)
+        _compare(
+            "many-small-records blob (all records once)",
+            len(backend_tokpress(blob)),
+            len(backend_parmar_style(blob)),
+            len(blob),
+        )
+
+        split = int(len(lines) * 0.7)
+        train, test = lines[:split], lines[split:]
+        test_raw = sum(len(r) for r in test)
+        d = TokDict.train(train)
+        enc = TokPressEncoder(dictionary=d)
+        tp_dict = sum(len(enc.compress(r)) for r in test) / test_raw
+        tp_dict_batch = len(compress_many(test, dictionary=d)) / test_raw
+        pm_test = sum(len(backend_parmar_style(r)) for r in test) / test_raw
+        test_blob = b"\n".join(test)
+        pm_blob = len(backend_parmar_style(test_blob)) / len(test_blob)
+        print(
+            f"{'many-small-records held-out + TokDict per-rec':<46} "
+            f"{tp_dict:>10.4f} {pm_test:>12.4f} {tp_dict - pm_test:>+10.4f} "
+            f"{'tokpress' if tp_dict < pm_test else 'parmar':>10}"
+        )
+        print(
+            f"{'many-small-records held-out + TokDict batch':<46} {tp_dict_batch:>10.4f} {pm_blob:>12.4f} "
+            f"{tp_dict_batch - pm_blob:>+10.4f} {'tokpress' if tp_dict_batch < pm_blob else 'parmar':>10}"
+        )
+
+    print(
+        f"\n  token-direct wins {wins['tokpress']} of {wins['tokpress'] + wins['parmar']} whole-stream/per-record regimes."
+    )
+    print("  Honest answer to VISION.md Sec 2: on whole-file code/JSON/logs, direct entropy coding does")
+    print("  NOT beat tokens->xz (xz's large-window LZ wins there). It wins the isolated per-record")
+    print("  case once a shared TokDict is trained (the table's +TokDict per-rec row), which is the")
+    print("  design target -- but tokens->xz over the whole concatenated blob can still edge the")
+    print("  dictionary-primed batch stream, so the gap to xz's large-window LZ is real, not hidden.")
+
+
 def _zstd_train_dict(train_records: list[bytes], max_dict_size: int = 16384) -> bytes | None:
     with tempfile.TemporaryDirectory() as tmpdir:
         sample_paths = []
@@ -1025,6 +1109,7 @@ def main() -> None:
         run_whole_file(name, path.read_bytes())
 
     run_many_small_records()
+    run_parmar_comparison()
     run_paper_scale_dictionary_regime()
     run_schema_regimes()
     run_ablations()

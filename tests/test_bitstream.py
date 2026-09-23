@@ -1,6 +1,7 @@
 import pytest
 
 from tokpress.bitstream import BitReader, BitWriter
+from tokpress.bitstream.varint import read_varint, write_varint
 
 
 def test_bitstream_mixed_widths_roundtrip():
@@ -40,6 +41,26 @@ def test_bitstream_read_beyond_data_raises():
     assert r.read_uint16() == 0x1234
     with pytest.raises(ValueError):
         r.read_uint32()
+
+
+def test_varint_roundtrip_and_length_cap():
+    w = BitWriter()
+    for value in (0, 1, 127, 128, 300, 2**32 - 1, 2**63 - 1):
+        write_varint(w, value)
+    w.flush()
+
+    r = BitReader(w.getvalue())
+    for value in (0, 1, 127, 128, 300, 2**32 - 1, 2**63 - 1):
+        assert read_varint(r) == value
+
+    # an all-continuation prefix would shift forever; it must be rejected
+    # instead of accumulating an unbounded integer.
+    runaway = BitWriter()
+    for _ in range(12):
+        runaway.write_byte(0x80)
+    runaway.flush()
+    with pytest.raises(ValueError, match="varint is longer than 64 bits"):
+        read_varint(BitReader(runaway.getvalue()))
 
 
 def test_u64_readable_after_partial_bit_reads():

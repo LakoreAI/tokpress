@@ -50,7 +50,9 @@ def compress(
     if fast and data:
         from .codec.encoder import MODE_RANS_ADAPTIVE_SPLIT
 
-        return _codec_for(dictionary, tokenizer).encoder.compress(data, force_mode=MODE_RANS_ADAPTIVE_SPLIT)
+        return _codec_for(dictionary, tokenizer).encoder.compress(
+            data, force_mode=MODE_RANS_ADAPTIVE_SPLIT, integrity=integrity
+        )
     return _codec_for(dictionary, tokenizer).compress(data, integrity=integrity)
 
 
@@ -83,17 +85,11 @@ def compress_many(
     return w.getvalue() + inner
 
 
-def decompress_many(
-    compressed_data: bytes,
-    dictionary: TokDict | None = None,
-    tokenizer: TiktokenTokenizer | None = None,
-) -> list[bytes]:
-    """Inverse of compress_many: returns the original records byte-exact. A plain single-record TokPress stream (returns it as a one-element list) or an indexed batch (TOKBI, see indexed_compress) is also accepted."""
-    if compressed_data.startswith(_INDEXED_MAGIC):
-        return indexed_decompress(compressed_data, dictionary=dictionary, tokenizer=tokenizer)
-    if not compressed_data.startswith(_BATCH_MAGIC):
-        return [decompress(compressed_data, dictionary=dictionary, tokenizer=tokenizer)]
-
+def _parse_batch_header(compressed_data: bytes) -> tuple[list[int], int]:
+    """Parse a TOKB header: returns (record_lengths, body_start)."""
+    version = compressed_data[4]
+    if version != _BATCH_VERSION:
+        raise ValueError(f"unsupported batch stream version {version} (expected {_BATCH_VERSION})")
     pos = 4 + 1  # magic + version
     n_records = int.from_bytes(compressed_data[pos : pos + 4], "little")
     pos += 4
@@ -110,20 +106,67 @@ def decompress_many(
             if not (byte & 0x80):
                 break
             shift += 7
+            if shift > 63:
+                raise ValueError("corrupt batch stream: record length varint is longer than 64 bits")
         lengths.append(value)
+    return lengths, pos
 
+
+def iter_decompress_many(
+    compressed_data: bytes,
+    dictionary: TokDict | None = None,
+    tokenizer: TiktokenTokenizer | None = None,
+):
+    """Lazily yield records from a TOKB batch, a TOKBI indexed batch, or a
+    plain single-record TOKZ stream, without materializing the whole record
+    list -- `decompress_many` is exactly `list(iter_decompress_many(...))`.
+
+    A TOKB/TOKZ body is still decoded in one pass (its adaptive entropy model
+    and LZ history span the whole batch, so it is not decodable record-at-a-
+    time); an indexed TOKBI batch is genuinely streamed, one self-contained
+    record at a time."""
+    if compressed_data.startswith(_INDEXED_MAGIC):
+        n_records, body_size, offsets, body_start = _parse_indexed_header(compressed_data)
+        for i in range(n_records):
+            start = body_start + offsets[i]
+            end = body_start + (offsets[i + 1] if i + 1 < n_records else body_size)
+            yield decompress(compressed_data[start:end], dictionary=dictionary, tokenizer=tokenizer)
+        return
+    if not compressed_data.startswith(_BATCH_MAGIC):
+        yield decompress(compressed_data, dictionary=dictionary, tokenizer=tokenizer)
+        return
+
+    lengths, pos = _parse_batch_header(compressed_data)
     blob = decompress(compressed_data[pos:], dictionary=dictionary, tokenizer=tokenizer)
-    records = []
-    offset = 0
-    for ln in lengths:
-        records.append(blob[offset : offset + ln])
-        offset += ln
-    if offset != len(blob):
+    total = sum(lengths)
+    if total != len(blob):
         raise ValueError(
             "corrupt batch stream: record lengths sum to "
-            f"{offset} bytes but the compressed stream decoded to {len(blob)}"
+            f"{total} bytes but the compressed stream decoded to {len(blob)}"
         )
-    return records
+    offset = 0
+    for ln in lengths:
+        yield blob[offset : offset + ln]
+        offset += ln
+
+
+def decompress_many(
+    compressed_data: bytes,
+    dictionary: TokDict | None = None,
+    tokenizer: TiktokenTokenizer | None = None,
+) -> list[bytes]:
+    """Inverse of compress_many: returns the original records byte-exact. A plain single-record TokPress stream (returns it as a one-element list) or an indexed batch (TOKBI, see indexed_compress) is also accepted. For a lazy iterator that avoids building the list, use `iter_decompress_many`."""
+    return list(iter_decompress_many(compressed_data, dictionary=dictionary, tokenizer=tokenizer))
+
+
+def batch_record_count(compressed_data: bytes) -> int:
+    """Number of records in a TOKB/TOKBI batch (or 1 for a plain single-record
+    TOKZ stream), read from the header without decoding any record."""
+    if compressed_data.startswith(_INDEXED_MAGIC):
+        return _parse_indexed_header(compressed_data)[0]
+    if compressed_data.startswith(_BATCH_MAGIC):
+        return len(_parse_batch_header(compressed_data)[0])
+    return 1
 
 
 def compress_file(
@@ -140,19 +183,28 @@ def compress_file(
         f.write(compressed)
 
 
-def decompress_file(input_path: str, output_path: str, dictionary: TokDict | None = None) -> None:
+def decompress_file(
+    input_path: str,
+    output_path: str,
+    dictionary: TokDict | None = None,
+    tokenizer: TiktokenTokenizer | None = None,
+) -> None:
     with open(input_path, "rb") as f:
         data = f.read()
-    restored = decompress(data, dictionary=dictionary)
+    restored = decompress(data, dictionary=dictionary, tokenizer=tokenizer)
     with open(output_path, "wb") as f:
         f.write(restored)
 
 
-def benchmark(input_path: str, dictionary: TokDict | None = None) -> dict:
+def benchmark(
+    input_path: str,
+    dictionary: TokDict | None = None,
+    tokenizer: TiktokenTokenizer | None = None,
+) -> dict:
     with open(input_path, "rb") as f:
         data = f.read()
 
-    codec = TokPressCodec(dictionary=dictionary) if dictionary is not None else _get_codec()
+    codec = TokPressCodec(dictionary=dictionary, tokenizer=tokenizer) if (dictionary or tokenizer) else _get_codec()
 
     t0 = time.perf_counter()
     compressed = codec.compress(data)
@@ -228,6 +280,9 @@ def _parse_indexed_header(compressed_data: bytes) -> tuple[int, int, list[int], 
         raise ValueError("not an indexed batch stream (bad TOKBI magic)")
     if len(compressed_data) < 14:
         raise ValueError("corrupt indexed batch: header truncated")
+    version = compressed_data[5]  # 5-byte TOKBI magic, then version
+    if version != _INDEXED_VERSION:
+        raise ValueError(f"unsupported indexed batch version {version} (expected {_INDEXED_VERSION})")
     n_records = int.from_bytes(compressed_data[6:10], "little")
     body_size = int.from_bytes(compressed_data[10:14], "little")
     body_start = 14 + 4 * n_records

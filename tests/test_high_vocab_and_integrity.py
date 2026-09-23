@@ -124,6 +124,75 @@ def test_integrity_on_empty_and_batch():
         decompress_many(bytes(bad))
 
 
+def test_fast_compress_honors_integrity():
+    """core.compress(fast=True) must still append the opt-in crc32 trailer
+    (+4 bytes, MODE_FLAG_INTEGRITY) and detect corruption -- previously the
+    fast/single-candidate branch returned before applying it."""
+    payload = b"the quick brown fox jumps over the lazy dog. " * 40
+
+    fast = compress(payload, fast=True)
+    fast_checked = compress(payload, fast=True, integrity=True)
+
+    assert len(fast_checked) == len(fast) + 4
+    assert fast_checked[5] & MODE_FLAG_INTEGRITY
+    assert decompress(fast_checked) == payload
+
+    flipped = bytearray(fast_checked)
+    flipped[-1] ^= 0xFF
+    with pytest.raises(ValueError):
+        decompress(bytes(flipped))
+
+
+def test_declared_size_mismatch_raises():
+    """The decoder must reject a stream whose declared uncompressed_size does
+    not match the bytes it actually decoded, even with no integrity trailer."""
+    enc = TokPressEncoder()
+    dec = TokPressDecoder()
+    payload = b"a schema-homogeneous JSON record: " * 30
+    c = enc.compress(payload)
+
+    declared = int.from_bytes(c[6:10], "little")
+    tampered = bytearray(c)
+    tampered[6:10] = (declared + 1).to_bytes(4, "little")
+    with pytest.raises(ValueError):
+        dec.decompress(bytes(tampered))
+
+
+def test_unknown_stream_versions_are_rejected():
+    """Every container version byte must be validated, not silently ignored."""
+    enc = TokPressEncoder()
+    dec = TokPressDecoder()
+
+    single = bytearray(enc.compress(b"hello world, hello world"))
+    single[4] = 0x7F  # TOKZ version byte
+    with pytest.raises(ValueError, match="unsupported TokPress stream version"):
+        dec.decompress(bytes(single))
+
+    packed = bytearray(compress_many([b"a", b"bb", b"ccc"]))
+    packed[4] = 0x7F  # TOKB version byte
+    with pytest.raises(ValueError, match="unsupported batch stream version"):
+        decompress_many(bytes(packed))
+
+    indexed = bytearray(indexed_compress([b"a", b"bb", b"ccc"]))
+    indexed[5] = 0x7F  # TOKBI is a 5-byte magic, so its version byte is at offset 5
+    with pytest.raises(ValueError, match="unsupported indexed batch version"):
+        decompress_many(bytes(indexed))
+
+
+def test_impossible_lz_token_count_raises():
+    """A corrupt header claiming more LZ tokens than the declared uncompressed
+    size could ever produce is rejected before any large decode loop runs."""
+    enc = TokPressEncoder()
+    dec = TokPressDecoder()
+    c = bytearray(enc.compress(b"hello world, hello world, hello world"))
+
+    # num_lz_tokens immediately follows the 10-byte header.
+    tampered = bytearray(c)
+    tampered[10:14] = (0xFFFFFFFF).to_bytes(4, "little")
+    with pytest.raises(ValueError, match="impossible LZ-token count"):
+        dec.decompress(bytes(tampered))
+
+
 @pytest.mark.slow
 def test_high_vocabulary_adaptive_roundtrips_at_shrunken_rans_m(small_rans_m):
     m = small_rans_m

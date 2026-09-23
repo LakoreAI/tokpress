@@ -67,7 +67,7 @@ class TokDict:
         tokenizer: TiktokenTokenizer | None = None,
         use_priming: bool = True,
         use_contexts: bool = True,
-        priming_mode: str = "concat",
+        priming_mode: str = "cover",
     ) -> "TokDict":
         """Train a TokDict on a sample of schema-homogeneous records.
 
@@ -98,8 +98,13 @@ class TokDict:
         against the full dictionary, as intended.
 
         `priming_mode` selects how the LZ priming buffer is filled from the
-        training sample: "concat" (default) head-concatenates token streams in
-        sample order until `max_priming_tokens`; "coverage" greedily selects the
+        training sample. The default is "cover" (the zstd-COVER mechanism; see
+        _priming_tokens_cover), chosen because a 25-seeded-split comparison
+        (scripts/bench.py's `run_priming_modes_repeated`) found it best-or-tied
+        on json logs and small records on both per-record and batch mode,
+        and statistically indistinguishable from the other pickers on package
+        metadata -- see docs/RESEARCH.md Sec 2.6. "concat" head-concatenates
+        token streams in sample order until `max_priming_tokens`; "coverage" greedily selects the
         records carrying the most of the corpus's frequent-token mass first
         (a simplified, token-level analogue of zstd's COVER sample selection) --
         see _priming_tokens_coverage; "diverse" is the COVER-style increment
@@ -320,15 +325,16 @@ class TokDict:
         -- fine for training-time use on the corpus sizes this project
         targets, not intended for a hot path.
 
-        Honest result (repeated 80/20 splits, 3 real schemas -- see
-        `docs/RESEARCH.md`): this mode is not a clean win over `concat` or
-        `diverse` (it wins per-record on json logs, loses on package
-        metadata, is close-but-not-best on batch mode everywhere). Kept as an
-        available, fully-tested option -- like `coverage`/`diverse` -- rather
-        than the default; the negative/mixed result is itself the useful
-        finding (it reinforces `TODO.md`'s existing conclusion that the
-        priming *cap*, not the picker's sophistication, is the dominant
-        lever).
+        Honest result (25 seeded 80/20 splits, 3 real schemas -- see
+        `docs/RESEARCH.md` Sec 2.6 and scripts/bench.py's
+        `run_priming_modes_repeated`): this is the best-or-tied picker on json
+        logs and small records on *both* per-record and batch mode, and
+        statistically indistinguishable from `concat`/`coverage`/`diverse` on
+        package metadata (all four means within ~1 stdev there). It is the
+        default `priming_mode`; `coverage` (whole-record, no discounting) is
+        the weakest picker across the board. The earlier 5-split measurement
+        that ranked `concat` first was under-powered (see the same section);
+        the repeated measurement is what promoted `cover`.
         """
         tokenized = [tokenizer.encode(s) for s in samples]
 

@@ -36,6 +36,29 @@ def test_file_api_accepts_dictionary(tmp_path):
     assert res["lossless"]
 
 
+def test_file_api_accepts_tokenizer(tmp_path):
+    """compress_file/decompress_file/benchmark accept tokenizer= like the
+    byte-level API -- a stream compressed with a custom vocab must decode
+    with the same one."""
+    from tokpress.tokenizer import bpe_trainer as bt
+    from tokpress.tokenizer.tiktoken_adapter import TiktokenTokenizer
+
+    ranks = {bytes([b]): b for b in range(256)}
+    tt = TiktokenTokenizer(encoding=bt.build_tiktoken_encoding(ranks, name="tokpress:test-byte-identity"))
+
+    src = tmp_path / "in.jsonl"
+    src.write_bytes(b'{"user": "u50", "action": "click", "ts": 1700000050}\n')
+    tokz = tmp_path / "out.tokz"
+    out = tmp_path / "restored.jsonl"
+
+    tokpress.compress_file(str(src), str(tokz), tokenizer=tt)
+    tokpress.decompress_file(str(tokz), str(out), tokenizer=tt)
+    assert out.read_bytes() == src.read_bytes()
+
+    res = tokpress.benchmark(str(src), tokenizer=tt)
+    assert res["lossless"]
+
+
 def test_tokenize_stats_shape_and_invariants():
     data = b'{"user": "u1", "action": "click"}\n' * 20
     s = tokpress.tokenize_stats(data)

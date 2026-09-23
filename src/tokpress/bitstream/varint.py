@@ -24,6 +24,8 @@ def read_varint(r: BitReader) -> int:
         if not (byte & 0x80):
             return result
         shift += 7
+        if shift > 63:
+            raise ValueError("corrupt bitstream: varint is longer than 64 bits")
 
 
 def write_symbol_list(w: BitWriter, sorted_ids: list[int]) -> None:

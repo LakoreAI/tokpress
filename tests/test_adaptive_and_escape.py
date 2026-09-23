@@ -40,11 +40,11 @@ def test_sparse_mode_escape_path_roundtrips():
     lz_tokens = list(range(n_distinct)) + [5, 5, 5, 10, 10]  # a few repeats for realism
     assert len(set(lz_tokens)) > RANS_M  # sanity: this test must actually exercise the escape path
 
-    compressed = enc._encode_rans_sparse(lz_tokens, n_raw=len(lz_tokens))
-    assert compressed[5] == MODE_RANS_SPARSE
-
     expected_tokens = dec._lz.decode(lz_tokens, [])
     expected_bytes = dec.tokenizer.decode(expected_tokens)
+
+    compressed = enc._encode_rans_sparse(lz_tokens, n_raw=len(expected_bytes))
+    assert compressed[5] == MODE_RANS_SPARSE
     assert dec.decompress(compressed) == expected_bytes
 
 

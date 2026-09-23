@@ -22,6 +22,7 @@ from .encoder import (
     MODE_RAW_FALLBACK,
     MODE_RAW_TOKENS,
     TOKZ_MAGIC,
+    TOKZ_VERSION,
 )
 from .token_lz import TokenLZMatch
 
@@ -48,6 +49,8 @@ class TokPressDecoder:
             raise ValueError("invalid TokPress stream: bad magic bytes")
 
         _version = r.read_byte()
+        if _version != TOKZ_VERSION:
+            raise ValueError(f"unsupported TokPress stream version {_version} (expected {TOKZ_VERSION})")
         header_mode = r.read_byte()
         header_flags = header_mode & ~MODE_MODE_MASK
         mode = header_mode & MODE_MODE_MASK
@@ -57,6 +60,16 @@ class TokPressDecoder:
             return b""
 
         num_lz_tokens = r.read_uint32()
+        # A record cannot expand past a small multiple of its uncompressed
+        # size: every token covers at least one byte, and the worst LZ case
+        # (all length-3 matches, 4 symbols each) is 4/3 symbols per token.
+        # Reject an impossible count up front so a corrupt/hostile header can
+        # never drive a multi-billion-iteration allocation loop.
+        if num_lz_tokens > 2 * uncompressed_size + 64:
+            raise ValueError(
+                f"corrupt TokPress stream: impossible LZ-token count {num_lz_tokens} "
+                f"for declared uncompressed size {uncompressed_size}"
+            )
 
         if mode == MODE_RAW_TOKENS:
             bits_per_symbol = r.read_byte()
@@ -431,4 +444,8 @@ class TokPressDecoder:
                     "TokPress integrity check failed: the stream is corrupt, truncated, "
                     "or was decoded under the wrong dictionary/vocabulary"
                 )
+        if len(plain) != uncompressed_size:
+            raise ValueError(
+                f"corrupt TokPress stream: decoded {len(plain)} bytes but the header declared {uncompressed_size}"
+            )
         return plain

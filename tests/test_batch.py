@@ -85,6 +85,32 @@ def test_batch_truncated_header_raises():
         tokpress.decompress_many(compressed[:8])
 
 
+def test_iter_decompress_many_is_lazy_and_matches_list():
+    records = _json_records(20)
+    packed = tokpress.compress_many(records)
+
+    it = tokpress.iter_decompress_many(packed)
+    assert iter(it) is it  # a generator, not a materialized list
+    assert list(it) == records
+    assert list(tokpress.iter_decompress_many(packed)) == tokpress.decompress_many(packed)
+
+
+def test_iter_decompress_many_indexed_and_single():
+    records = _json_records(15)
+    indexed = tokpress.indexed_compress(records)
+    assert list(tokpress.iter_decompress_many(indexed)) == records
+
+    single = tokpress.compress(records[0])
+    assert list(tokpress.iter_decompress_many(single)) == [records[0]]
+
+
+def test_batch_record_count_without_decoding():
+    records = _json_records(7)
+    assert tokpress.batch_record_count(tokpress.compress_many(records)) == 7
+    assert tokpress.batch_record_count(tokpress.indexed_compress(records)) == 7
+    assert tokpress.batch_record_count(tokpress.compress(records[0])) == 1
+
+
 def test_indexed_batch_roundtrip():
     rng = random.Random(5)
     records = [os.urandom(rng.randrange(1, 300)) for _ in range(25)]
