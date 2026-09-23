@@ -4,10 +4,12 @@ A restricted vocabulary is only a valid tokenizer if every non-single-byte token
 
 Training must match how tiktoken encodes: `Encoding._encode_bytes` routes valid UTF-8 through `encode_ordinary`, which splits the input on the regex `pat_str` and runs BPE per regex piece (only invalid-UTF-8 tails get pure whole-input byte BPE). A vocabulary trained with naive whole-input BPE therefore fragments on piece boundaries and under-performs, so this trainer pre-tokenizes the corpus with the same `pat_str` and forbids merges across piece boundaries -- the standard GPT-style pipeline -- making the trained vocab's encoding exactly reproducible by tiktoken.
 
-Correctness-first, deliberately not a scale-optimized trainer: the byte-level BPE loop is O(num_merges * corpus_size) in the pure-Python list rebuild, so training is meant for a sampled corpus (default cap 256KB), an offline one-time cost.
+Correctness-first: the pure-Python fallback loop is O(num_merges * corpus_size), so training is meant for a sampled corpus (default cap 256KB), an offline one-time cost; the Rust core (tokpress._rs.bpe_merges) selects merges identically and is roughly 400x faster.
 """
 
 import re
+
+from .._backend import rust
 
 _STRIDE = 1 << 16  # single-int pair keys: a * STRIDE + b, valid for vocab sizes up to 2^16
 
@@ -85,6 +87,16 @@ def _train_pieces(
 
     vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
     merge_sequence: list[tuple[bytes, bytes]] = []
+
+    rs = rust()
+    if rs is not None:
+        for a, b in rs.bpe_merges(pieces, vocab_size):
+            merge_sequence.append((vocab[a], vocab[b]))
+            vocab[256 + len(merge_sequence) - 1] = vocab[a] + vocab[b]
+        if progress is not None and merge_sequence:
+            progress(len(merge_sequence), vocab_size - 256)
+        return {vocab[i]: i for i in range(256 + len(merge_sequence))}, merge_sequence
+
     stats = _get_stats(ids, boundaries)
 
     num_merges = vocab_size - 256

@@ -1,0 +1,20 @@
+[package]
+name = "tokpress-rs"
+version = "0.1.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust core for tokpress: token LZ77, rANS, wire-format encode/decode, BPE trainer"
+
+[lib]
+name = "_rs"
+path = "rust/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

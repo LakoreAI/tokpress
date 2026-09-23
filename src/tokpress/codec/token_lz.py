@@ -1,5 +1,7 @@
 """Token-level LZ77 with dictionary priming: a shared cross-record match history (zstd/FemtoZip-style) lets a record match against material learned from other records."""
 
+from .._backend import rust
+
 DEFAULT_MATCH_FLAG = 0x0FFF  # 4095, a symbol above normal vocab range
 MATCH_WINDOW = 32768  # keeps distances < 2**16 (2-byte distance field)
 MIN_MATCH_LEN = 3  # measured empirically: the "3-4 is a net loss" assumption behind the
@@ -21,6 +23,12 @@ class TokenLZMatch:
         self.match_flag = match_flag
 
     def encode(self, tokens: list[int], dictionary: list[int] = ()) -> list[int]:
+        rs = rust()
+        if rs is not None:
+            return rs.lz_encode(tokens, list(dictionary), self.match_flag)
+        return self._encode_py(tokens, dictionary)
+
+    def _encode_py(self, tokens: list[int], dictionary: list[int] = ()) -> list[int]:
         match_flag = self.match_flag
         d = len(dictionary)
         combined = list(dictionary) + list(tokens)
@@ -69,6 +77,12 @@ class TokenLZMatch:
         return output
 
     def decode(self, lz_tokens: list[int], dictionary: list[int] = ()) -> list[int]:
+        rs = rust()
+        if rs is not None:
+            return rs.lz_decode(lz_tokens, list(dictionary), self.match_flag)
+        return self._decode_py(lz_tokens, dictionary)
+
+    def _decode_py(self, lz_tokens: list[int], dictionary: list[int] = ()) -> list[int]:
         match_flag = self.match_flag
         output = list(dictionary)
         d = len(dictionary)

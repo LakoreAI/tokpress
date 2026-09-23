@@ -2,6 +2,7 @@
 
 import zlib
 
+from .._backend import rust
 from ..bitstream import BitReader, read_symbol_list
 from ..dictionary import MIN_CONTEXT_TRANSITIONS, TokDict
 from ..entropy.frequency import SymbolStats
@@ -42,6 +43,45 @@ class TokPressDecoder:
         return stats
 
     def decompress(self, compressed_bytes: bytes) -> bytes:
+        rs = rust()
+        if rs is not None:
+            return self._decompress_rs(rs, compressed_bytes)
+        return self._decompress_py(compressed_bytes)
+
+    def _decompress_rs(self, rs, compressed_bytes: bytes) -> bytes:
+        handle = self.dictionary.rs_handle() if self.dictionary is not None else None
+        mode, header_flags, uncompressed_size, tokens, trailer_pos = rs.decode_stream(
+            bytes(compressed_bytes), self.tokenizer.match_flag, handle
+        )
+        if uncompressed_size == 0 or mode == MODE_RAW_FALLBACK:
+            return b""
+        plain = self.tokenizer.decode(tokens)
+        self._check_trailer(compressed_bytes[trailer_pos:], header_flags, plain, uncompressed_size)
+        return plain
+
+    def _check_trailer(self, trailer: bytes, header_flags: int, plain: bytes, uncompressed_size: int) -> None:
+        r = BitReader(trailer)
+        if header_flags & MODE_FLAG_IDENTITY:
+            stamp = bytes(r.read_byte() for _ in range(8))
+            if stamp != self.tokenizer.vocab_fingerprint:
+                raise ValueError(
+                    "TokPress stream was compressed with a different vocabulary than "
+                    "the one supplied to this decoder -- pass the same --vocab/rank file "
+                    "that was used at compress time"
+                )
+        if header_flags & MODE_FLAG_INTEGRITY:
+            expected = r.read_uint32()
+            if expected != (zlib.crc32(plain) & 0xFFFFFFFF):
+                raise ValueError(
+                    "TokPress integrity check failed: the stream is corrupt, truncated, "
+                    "or was decoded under the wrong dictionary/vocabulary"
+                )
+        if len(plain) != uncompressed_size:
+            raise ValueError(
+                f"corrupt TokPress stream: decoded {len(plain)} bytes but the header declared {uncompressed_size}"
+            )
+
+    def _decompress_py(self, compressed_bytes: bytes) -> bytes:
         r = BitReader(compressed_bytes)
 
         magic = bytes(r.read_byte() for _ in range(4))

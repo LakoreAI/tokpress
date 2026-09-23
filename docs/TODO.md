@@ -153,9 +153,10 @@ Priorities come from a review of the benchmark/STATUS claims (2026-08-31):
       (<512 syms) it is ratio-neutral (adaptive-split already wins the gate
       there) and only ~5% faster.** The gate cost is not the small-record
       bottleneck; refuse `--dict` with `--fast`.
-- [ ] **Native port (long-term).** Rust/C++ rANS + LZ with SIMD multi-state
-      interleaving. Only after the above are exhausted; does not change the
-      research idea.
+- [x] **Native port (first pass).** Rust core via PyO3/maturin (`rust/`,
+      `tokpress._rs`), byte-identical to the Python reference; see STATUS.md.
+- [ ] **Native port, second pass.** Multi-state interleaved rANS (a wire-format
+      change), `TokDict.train` table building in Rust, batch containers.
 
 ## 4. Dataset breadth
 
@@ -209,7 +210,7 @@ Priorities come from a review of the benchmark/STATUS claims (2026-08-31):
       subset on PRs and the full suite + a self-contained ratio regression gate
       (`scripts/bench_regression.py`) nightly; `@pytest.mark.slow` tags the
       heavy large-payload tests.
-- [ ] **Release a real 0.1.0**: cut and push the git tag, add a wheel-build +
+- [ ] **Publish wheels**: `v0.1.0`/`v0.1.1` are tagged; add a maturin wheel-build +
       publish step to CI, and settle the remaining dependency caveat (the
       private `tiktoken._encode_bytes` API -- now pinned by the vocabulary
       fingerprint at runtime, but still version-sensitive).

@@ -2,6 +2,8 @@
 
 RANS_M_BITS/RANS_M are defined here, not in entropy/rans.py, to avoid a circular import (rans.py imports SymbolStats from this module) and to make this module the single source of truth for the table-log; rans.py derives RANS_L from RANS_M instead of keeping its own copy."""
 
+from itertools import accumulate
+
 RANS_M_BITS = 16
 RANS_M = 1 << RANS_M_BITS  # 65536
 
@@ -75,20 +77,14 @@ class SymbolStats:
 
     def finalize_cum_freq(self, build_decode_lut: bool = True) -> None:
         if build_decode_lut:
-            cum = 0
-            for i in range(self.alphabet_size):
-                self.cum_freq[i] = cum
-                cum += self.freq[i]
-            self.cum_freq[self.alphabet_size] = cum
-            self.total_freq = cum
-
-            slot_to_symbol = [0] * cum
-            pos = 0
-            for i in range(self.alphabet_size):
-                f = self.freq[i]
-                for _ in range(f):
-                    slot_to_symbol[pos] = i
-                    pos += 1
+            freq = self.freq
+            active = self.active if self.active else [i for i, f in enumerate(freq) if f]
+            cum_freq = list(accumulate(freq, initial=0))
+            self.cum_freq = cum_freq
+            self.total_freq = cum_freq[-1]
+            slot_to_symbol: list[int] = []
+            for i in active:
+                slot_to_symbol.extend([i] * freq[i])
             self.slot_to_symbol = slot_to_symbol
         else:
             # Encode path: rANS only reads cum_freq at active symbols, so

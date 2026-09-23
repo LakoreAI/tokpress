@@ -1,11 +1,11 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
 
 [project]
 name = "tokpress"
 version = "0.1.1"
-description = "A pure-Python, tiktoken-tokenizer-driven, rANS-entropy-coded lossless compressor."
+description = "A tiktoken-tokenizer-driven, rANS-entropy-coded lossless compressor with a Rust core and a pure-Python fallback."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -31,8 +31,10 @@ Repository = "https://github.com/LakoreAI/tokpress"
 [project.scripts]
 tokpress = "tokpress.cli:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/tokpress"]
+[tool.maturin]
+python-source = "src"
+module-name = "tokpress._rs"
+features = ["pyo3/extension-module"]
 
 [project.optional-dependencies]
 dev = [

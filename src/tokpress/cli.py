@@ -20,6 +20,7 @@ HELP_TEXT = """Usage:
   tokpress bench <input_path>
   tokpress tokenize-stats <input_path> [--vocab <vocab.ranks>]
   tokpress train-dict <output.tokdict> <sample_path> [sample_path ...] [--priming-mode MODE]
+  tokpress dict-info <dict.tokdict>
   tokpress train-vocab <output.ranks> <corpus_path> [corpus_path ...] [--vocab-size N] [--max-bytes N]
   tokpress fit <out_prefix> <corpus_path> [corpus_path ...] [--vocab-size N] [--max-bytes N] [--priming-mode MODE]
 
@@ -282,6 +283,16 @@ def cmd_train_dict(args: list[str]) -> int:
     print(f"  priming mode:    {priming_mode}")
     print(f"  priming tokens:  {len(dictionary.priming_tokens)}")
     print(f"  table symbols:   {n_active}")
+    return 0
+
+
+def cmd_dict_info(args: list[str]) -> int:
+    if len(args) < 3:
+        print("Error: usage: tokpress dict-info <dict.tokdict>")
+        return 1
+    info = TokDict.load(args[2]).info()
+    for key, value in info.items():
+        print(f"{key:>16}: {value}")
     return 0
 
 
@@ -558,6 +569,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_tokenize_stats(args)
     elif cmd == "train-dict":
         return cmd_train_dict(args)
+    elif cmd == "dict-info":
+        return cmd_dict_info(args)
     elif cmd == "train-vocab":
         return cmd_train_vocab(args)
     elif cmd == "fit":

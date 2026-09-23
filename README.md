@@ -1,6 +1,6 @@
 # TokPress (`tokpress`)
 
-A pure-Python, **tokenizer-driven lossless compressor**: it tokenizes input with
+A **tokenizer-driven lossless compressor** with a Rust core and a byte-identical pure-Python fallback: it tokenizes input with
 tiktoken's `o200k_base` encoding (the tokenizer behind OpenAI's GPT models),
 applies token-level LZ77, then entropy-codes the result with rANS. It is built
 for **many small, independent, schema-homogeneous records** — structured logs,
@@ -16,8 +16,9 @@ basis.
 > designed for — many small JSON-style records compressed with a shared trained
 > dictionary — it reaches **0.2537** (per record) and **0.2256** (batch), which
 > beats every dictionary-less baseline and closes most of the gap to `zstd`
-> with a matched dictionary (0.1371). It is pure Python, Apache-2.0, and needs
-> only one runtime dependency (`tiktoken`).
+> with a matched dictionary (0.1371). It is Apache-2.0 with a Rust-accelerated
+> core (pure-Python fallback included) and needs only one runtime dependency
+> (`tiktoken`).
 
 `pip install`, import, done.
 
@@ -37,7 +38,8 @@ basis.
 12. [Testing](#testing)
 13. [FAQ](#faq)
 14. [Further reading](#further-reading)
-15. [Project layout](#project-layout)
+15. [Citation](#citation)
+16. [Project layout](#project-layout)
 
 ---
 
@@ -106,12 +108,12 @@ neural network at compress time).
 | **Tokenizer** | tiktoken `o200k_base` (or a custom trained vocabulary) |
 | **Entropy coding** | rANS (asymmetric numeral systems) over LZ77 match tuples |
 | **Target workload** | Many small, schema-homogeneous records (JSON logs, telemetry, API/package metadata) |
-| **Python API** | `compress` / `decompress` / `compress_many` / `decompress_many` / `iter_decompress_many` / `TokDict.train` / `tokenize_stats` |
-| **CLI** | `tokpress compress|decompress|pack|unpack|read|bench|tokenize-stats|train-dict|train-vocab|fit` |
-| **Language** | Pure Python (3.10+) |
+| **Python API** | `compress` / `decompress` / `compress_each` / `decompress_each` / `compress_many` / `decompress_many` / `iter_decompress_many` / `TokDict.train` / `tokenize_stats` |
+| **CLI** | `tokpress compress|decompress|pack|unpack|read|bench|tokenize-stats|train-dict|dict-info|train-vocab|fit` |
+| **Language** | Python 3.10+ with an optional Rust core (`tokpress._rs`, byte-identical to the pure-Python reference) |
 | **Dependencies** | `tiktoken` only |
 | **License** | Apache-2.0 |
-| **Verification** | 124 tests + a deterministic ratio-regression gate in CI |
+| **Verification** | 139 tests (incl. Rust-vs-Python byte parity) + a deterministic ratio-regression gate in CI |
 
 ---
 
@@ -119,10 +121,15 @@ neural network at compress time).
 
 ```bash
 cd tokpress
-pip install -e .
+pip install -e .        # builds the Rust extension via maturin (needs a Rust toolchain)
+make rust               # or: maturin develop --release, inside your venv
 ```
 
-The only third-party dependency is `tiktoken`.
+The only third-party Python dependency is `tiktoken`. The compiled extension
+accelerates LZ77, rANS encode/decode, every wire mode, `TokDict` priming, and
+the BPE trainer. If it is absent, or `TOKPRESS_PURE_PYTHON=1` is set, every
+path falls back to the reference Python implementation, which emits
+byte-identical streams (enforced by `tests/test_rust_parity.py`).
 
 ---
 
@@ -219,6 +226,15 @@ the dictionary itself, and refuses to decompress against the wrong one.
 Batch + dictionary: `pack`/`compress_many` accept `--dict`, so one adaptive
 stream over a batch of records can also be primed with the trained
 dictionary.
+
+#### Parallel helpers and inspection
+
+- `compress_each` / `decompress_each` process independent records on a thread
+  pool (gain is modest today: 0.64 s -> 0.51 s for 4,600 small records).
+- `tokpress dict-info d.tokdict` / `TokDict.info()` print the dictionary id
+  (its fingerprint), priming size and table counts.
+- `TokDict.train` accepts `segment_len`, `dmer_len` and `discount` to tune the
+  `cover` priming picker.
 
 ### Custom vocabulary training (`train-vocab`)
 
@@ -343,7 +359,7 @@ beats gzip/zstd/lzma on, per record, and where a trained `TokDict` turns a
 
 **Don't use it when** records are large, one-off, or already highly repetitive
 (whole files), when you need zstd-class throughput (TokPress is deliberately
-pure Python and slower), or when you have no training data and must compress
+the Python fallback is slow and even the Rust core is not zstd-class), or when you have no training data and must compress
 one tiny record in isolation — without a dictionary, small records can come
 out *larger* than the input (measured: 0.81× on schema-homogeneous records
 compressed one at a time). Use `compress_many` (batch mode) to fix that even
@@ -351,11 +367,14 @@ without a dictionary.
 
 ## Performance and compression ratio
 
-TokPress is pure Python; expect noticeably lower throughput than a compiled/
-native implementation, dominated by Python-level per-symbol loop overhead in
-the rANS coder. It has not been optimized for speed. Decompression runs only
-the mode the encoder chose and is far faster than compression, which builds
-several candidate modes per record and keeps the smallest.
+With the Rust core, alice29.txt (152 KB) compresses in ~0.4 s and decompresses
+in ~0.03 s, versus ~10 s and ~51 s for the pure-Python reference (same output
+bytes; single run, one machine -- measure your own with `tokpress bench`).
+BPE vocabulary training is ~400x faster and priming-buffer selection
+(`cover`) moves to Rust as well. Compression is still slower than
+decompression because the encoder builds several candidate modes per record
+and keeps the smallest; decompression runs only the chosen mode. Tokenization
+itself still goes through tiktoken.
 
 ---
 
@@ -366,7 +385,7 @@ pip install -e .
 pytest tests/
 ```
 
-The suite (124 tests) covers bitstream and rANS roundtrips (incl. the
+The suite (139 tests) covers bitstream and rANS roundtrips (incl. the
 single-symbol-alphabet edge case), token-level LZ77 roundtrip, the tiktoken
 adapter's byte-exact roundtrip on arbitrary binary input (including invalid
 UTF-8), full codec roundtrips across payload shapes, `TokDict`
@@ -430,7 +449,7 @@ pure-Python reference for the technique.
 **Is TokPress an LLM / AI compressor?**
 No neural network runs at compress or decompress time. TokPress only reuses the
 *tokenizer* (a pretrained BPE vocabulary) — the heavy part is LZ77 + rANS in
-pure Python. LLM-as-predictor compressors are the known ceiling here, but they
+Rust (or the Python fallback). LLM-as-predictor compressors are the known ceiling here, but they
 need a multi-billion-parameter model per record; TokPress is the cheap end of
 that idea.
 
@@ -480,6 +499,36 @@ trained dictionaries, and tiktoken-format `.ranks` for custom vocabularies.
 
 ---
 
+## Citation
+
+The design and measurements are written up in a technical report:
+
+> Minh Đức Lê. *TokPress: A Tokenizer-Domain Entropy Coder with a Trained
+> Dictionary and Order-1 Fallback Cascade (Technical Report)*. August 2026.
+> DOI: [10.13140/RG.2.2.14267.58409](https://doi.org/10.13140/RG.2.2.14267.58409)
+> ([ResearchGate](https://www.researchgate.net/publication/413792124_TokPress_A_Tokenizer-Domain_Entropy_Coder_with_a_Trained_Dictionary_and_Order-1_Fallback_Cascade_Technical_Report))
+
+```bibtex
+@techreport{le2026tokpress,
+  author      = {Lê, Minh Đức},
+  title       = {{TokPress}: A Tokenizer-Domain Entropy Coder with a Trained
+                 Dictionary and Order-1 Fallback Cascade},
+  type        = {Technical Report},
+  institution = {Vietnamese-German University},
+  year        = {2026},
+  month       = aug,
+  doi         = {10.13140/RG.2.2.14267.58409},
+  url         = {https://www.researchgate.net/publication/413792124}
+}
+```
+
+The report's tables were measured with the earlier `concat` priming default
+and 8192-token priming cap (its abstract quotes 0.2565 per-record with a
+trained `TokDict`); the numbers in this README reflect the current `cover`
+default and 4096-token cap.
+
+---
+
 ## Project layout
 
 ```
@@ -492,7 +541,10 @@ tokpress/
 │   ├── codec/              # token-LZ77, encoder/decoder (wire format)
 │   ├── dictionary.py       # TokDict: trained cross-record dictionary
 │   ├── native.py           # the runtime encoder/decoder pair
+│   ├── _backend.py         # loads the Rust extension / pure-Python fallback switch
 │   ├── core.py             # public compress/decompress/... API
 │   └── cli.py              # `tokpress` command-line entry point
+├── rust/                   # Rust core (PyO3): LZ77, rANS, wire modes, BPE + COVER trainers
+├── Cargo.toml
 └── tests/
 ```

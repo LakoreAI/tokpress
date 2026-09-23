@@ -41,7 +41,7 @@ MIN_CONTEXT_TRANSITIONS = 20
 
 
 class TokDict:
-    __slots__ = ("priming_tokens", "stats", "context_stats", "fingerprint")
+    __slots__ = ("priming_tokens", "stats", "context_stats", "fingerprint", "_rs_handle")
 
     def __init__(
         self,
@@ -54,6 +54,23 @@ class TokDict:
         self.stats = stats
         self.context_stats = context_stats
         self.fingerprint = fingerprint
+        self._rs_handle = None
+
+    def rs_handle(self):
+        """Lazily built Rust view of this dictionary (sparse tables), cached on the object."""
+        if self._rs_handle is None:
+            from ._backend import rust
+
+            rs = rust()
+            pairs = lambda st: [(i, st.freq[i]) for i in st.active]  # noqa: E731
+            self._rs_handle = rs.RsDict(
+                self.stats.alphabet_size,
+                list(self.priming_tokens),
+                pairs(self.stats),
+                [(ctx, pairs(st)) for ctx, st in self.context_stats.items()],
+                bytes(self.fingerprint),
+            )
+        return self._rs_handle
 
     @property
     def escape_symbol(self) -> int:
@@ -68,6 +85,9 @@ class TokDict:
         use_priming: bool = True,
         use_contexts: bool = True,
         priming_mode: str = "cover",
+        segment_len: int = 256,
+        dmer_len: int = 8,
+        discount: float = 0.3,
     ) -> "TokDict":
         """Train a TokDict on a sample of schema-homogeneous records.
 
@@ -139,7 +159,9 @@ class TokDict:
         elif priming_mode == "diverse":
             priming_tokens = cls._priming_tokens_diverse(samples, tokenizer, max_priming_tokens)
         elif priming_mode == "cover":
-            priming_tokens = cls._priming_tokens_cover(samples, tokenizer, max_priming_tokens)
+            priming_tokens = cls._priming_tokens_cover(
+                samples, tokenizer, max_priming_tokens, segment_len, dmer_len, discount
+            )
         elif priming_mode == "concat":
             priming_tokens = []
             for sample in samples:
@@ -197,6 +219,16 @@ class TokDict:
 
         fingerprint = cls._fingerprint(priming_tokens, raw_counts, context_stats)
         return cls(priming_tokens, stats, context_stats, fingerprint)
+
+    def info(self) -> dict:
+        """Summary of the dictionary: id, priming size, alphabet and context-table counts."""
+        return {
+            "id": self.fingerprint.hex(),
+            "alphabet_size": self.stats.alphabet_size,
+            "priming_tokens": len(self.priming_tokens),
+            "order0_symbols": len(self.stats.active),
+            "context_tables": len(self.context_stats),
+        }
 
     @staticmethod
     def _priming_tokens_coverage(
@@ -337,6 +369,12 @@ class TokDict:
         the repeated measurement is what promoted `cover`.
         """
         tokenized = [tokenizer.encode(s) for s in samples]
+
+        from ._backend import rust
+
+        rs = rust()
+        if rs is not None:
+            return rs.cover_priming(tokenized, max_priming_tokens, segment_len, dmer_len, discount)
 
         dmer_freq: dict[tuple[int, ...], int] = {}
         for toks in tokenized:
@@ -500,5 +538,6 @@ class TokDict:
             sym_id, freq = struct.unpack_from("<IH", data, pos)
             pos += 6
             stats.freq[sym_id] = freq
+            stats.active.append(sym_id)
         stats.finalize_cum_freq(build_decode_lut=True)
         return stats, pos

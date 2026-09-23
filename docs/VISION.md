@@ -23,9 +23,9 @@ The human need is real and paid-for. The gap: all of the above are closed, nativ
 
 ## 2. The claim TokPress can own
 
-TokPress will not win on speed — it is pure Python and never will. It will not win on single-record ratio in the smallest size regime (per-record headers and sparse tables can inflate a tiny record; STATUS.md documents a 70-byte JSON sample coming out at 81 bytes). What it *can* defensibly claim, and be the only codebase that makes it:
+TokPress will not win on speed — even with its Rust core (added after this document was written) it is not zstd-class, and the pure-Python reference is far slower. It will not win on single-record ratio in the smallest size regime (per-record headers and sparse tables can inflate a tiny record; STATUS.md documents a 70-byte JSON sample coming out at 81 bytes). What it *can* defensibly claim, and be the only codebase that makes it:
 
-> **Tokenizer-domain entropy coding is a real, measurable technique for many-small-homogeneous-records, and here is a complete, from-scratch, byte-exact, pure-Python implementation of it — plus honest before/after numbers for when it wins and when it doesn't.**
+> **Tokenizer-domain entropy coding is a real, measurable technique for many-small-homogeneous-records, and here is a complete, from-scratch, byte-exact implementation of it (Rust core plus a pure-Python reference) — plus honest before/after numbers for when it wins and when it doesn't.**
 
 The concrete, currently-unclaimed measurement:
 

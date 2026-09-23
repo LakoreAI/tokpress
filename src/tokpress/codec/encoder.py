@@ -12,6 +12,7 @@ The raw-tokens candidate is always built; the rANS-adaptive and PPM candidates a
 import struct
 import zlib
 
+from .._backend import rust
 from ..bitstream import BitWriter, write_symbol_list
 from ..dictionary import MIN_CONTEXT_TRANSITIONS, TokDict
 from ..entropy.frequency import SymbolStats
@@ -103,8 +104,19 @@ class TokPressEncoder:
             return w.getvalue()
 
         tokens = self.tokenizer.encode(raw_bytes)
-        lz_tokens = self._lz.encode(tokens, [])
         bits_per_symbol = max(1, self.tokenizer.match_flag.bit_length())
+        rs = rust()
+        if rs is not None:
+            payload = rs.compress_tokens(
+                tokens,
+                n_raw,
+                self.tokenizer.match_flag,
+                bits_per_symbol,
+                self.dictionary.rs_handle() if self.dictionary is not None else None,
+                force_mode,
+            )
+            return self._finish(payload, raw_bytes, integrity)
+        lz_tokens = self._lz.encode(tokens, [])
 
         candidates: dict[int, bytes] = {
             MODE_RAW_TOKENS: self._encode_raw_tokens(lz_tokens, n_raw, bits_per_symbol),
@@ -139,6 +151,9 @@ class TokPressEncoder:
         else:
             payload = min(candidates.values(), key=len)
 
+        return self._finish(payload, raw_bytes, integrity)
+
+    def _finish(self, payload: bytes, raw_bytes: bytes, integrity: bool) -> bytes:
         # Flag bits + trailing payloads are applied to the winning stream only,
         # after the mode byte has been written at offset 5 (header layout is
         # fixed: magic(4) + version(1) + mode(1) + size(u32)), so the underlying
@@ -166,6 +181,9 @@ class TokPressEncoder:
 
     def _encode_rans_sparse(self, lz_tokens: list[int], n_raw: int) -> bytes:
         """Order-0 rANS with an escape symbol for the long tail. A single table can only hold RANS_M distinct symbols (see entropy/frequency.py's count_symbols), and long, lexically diverse text can still exceed even RANS_M=65536. Rather than gating this mode out entirely (which would silently fall back to flat bit-packing for any record over the line), keep only the RANS_M-1 most frequent symbols in the table and route everything else through a reserved escape symbol, exactly like dictionary.py's TokDict. Always structurally valid; whether it wins is decided purely by final size."""
+        rs = rust()
+        if rs is not None:
+            return bytes(rs.encode_mode(MODE_RANS_SPARSE, lz_tokens, n_raw, self.tokenizer.match_flag, 0))
         real_alphabet_size = self.tokenizer.match_flag + 1
         escape_symbol = real_alphabet_size
         alphabet_size = real_alphabet_size + 1
@@ -224,6 +242,9 @@ class TokPressEncoder:
 
     def _encode_rans_split(self, lz_tokens: list[int], n_raw: int) -> bytes:
         """Order-0 rANS with LZ match-metadata split into its own tables instead of sharing one table with literal tokens. A match tuple's distance/length bytes are near-uniform over [0, 255], a completely different distribution from literal tokens' Zipfian one, and low-value distance/length bytes numerically collide with low-id literal tokens in a shared table, diluting both distributions. Measured directly: a role bit (literal-vs-match) plus three small [0,255] tables for distance-high, distance-low, and length bytes, versus one shared literal+metadata table, saves 6-16% of the entropy-coded payload. This previously hurt at the old RANS_M=4096 (splitting a 4096-slot budget across more tables cost the far more frequent literals more than it helped rare match metadata), but no longer applies now that every table gets its own full RANS_M=65536 budget. The literal table still needs escape-capping (same as _encode_rans_sparse); the three metadata tables and the role-bit table never do, since [0,255] and {0,1} always fit within RANS_M."""
+        rs = rust()
+        if rs is not None:
+            return bytes(rs.encode_mode(MODE_RANS_SPLIT, lz_tokens, n_raw, self.tokenizer.match_flag, 0))
         match_flag = self.tokenizer.match_flag
         real_alphabet_size = match_flag + 1
         escape_symbol = real_alphabet_size
@@ -355,6 +376,9 @@ class TokPressEncoder:
 
     def _encode_rans_adaptive_split(self, lz_tokens: list[int], n_raw: int) -> bytes:
         """Combines _encode_rans_split's match-metadata separation with _encode_rans_adaptive's zero-transmission-cost chunked history, applied to the literal sub-stream specifically (role/distance/length stay static small tables, since their alphabets are always tiny and there is little to gain from adaptivity there). Measured independently, match-metadata separation alone helps records where chunked-adaptive does not win, and vice versa; this mode lets both wins stack for records where they would otherwise trade off against each other via the min(candidates, key=len) selection."""
+        rs = rust()
+        if rs is not None:
+            return bytes(rs.encode_mode(MODE_RANS_ADAPTIVE_SPLIT, lz_tokens, n_raw, self.tokenizer.match_flag, 0))
         match_flag = self.tokenizer.match_flag
         n = len(lz_tokens)
 
@@ -453,6 +477,9 @@ class TokPressEncoder:
 
         Records with more than RANS_M-1 distinct symbols (an ordinary possibility now that RANS_M is large only in the sense that real corpora stay under it -- see the sparse mode) escape-cap the transmitted alphabet to the RANS_M-1 most frequent symbols and route everything else through a reserved escape slot whose value is carried out-of-band (MODE_FLAG_EXT layout, and only then: without escapes the layout is byte-identical to the plain one). The escape slot's Laplace mass is counted like any other symbol, so its probability is never zero in any chunk table.
         """
+        rs = rust()
+        if rs is not None:
+            return bytes(rs.encode_mode(MODE_RANS_ADAPTIVE, lz_tokens, n_raw, self.tokenizer.match_flag, 0))
         n = len(lz_tokens)
         counts: dict[int, int] = {}
         for sym in lz_tokens:
@@ -519,6 +546,9 @@ class TokPressEncoder:
 
         A record whose distinct-symbol count would exceed RANS_M-1 escapes-caps the active alphabet to the RANS_M-1 most frequent symbols (MODE_FLAG_EXT layout; byte-identical to the plain one otherwise): symbols beyond the cap are routed through an order-0 escape slot (Laplace-initiated at 1 like every other slot) and their real values travel out-of-band. Dropped symbols never enter the count tables, so both sides still derive identical tables; only the escape slot's own mass grows with each fall-through.
         """
+        rs = rust()
+        if rs is not None:
+            return bytes(rs.encode_mode(MODE_RANS_PPM, lz_tokens, n_raw, self.tokenizer.match_flag, 0))
         n = len(lz_tokens)
         counts: dict[int, int] = {}
         for sym in lz_tokens:
@@ -612,6 +642,9 @@ class TokPressEncoder:
 
     def _encode_rans_ppm_split(self, lz_tokens: list[int], n_raw: int) -> bytes:
         """Combines _encode_rans_ppm's order-1 cascade (applied to the literal sub-stream) with _encode_rans_split's match-metadata separation. The literal stream gets the PPM-style order-1 -> order-0 -> out-of-band cascade over a capped local alphabet; match metadata stays in static small tables. The two wins stack: metadata separation helps records where PPM does not, and vice versa."""
+        rs = rust()
+        if rs is not None:
+            return bytes(rs.encode_mode(MODE_RANS_PPM_SPLIT, lz_tokens, n_raw, self.tokenizer.match_flag, 0))
         match_flag = self.tokenizer.match_flag
         n = len(lz_tokens)
 

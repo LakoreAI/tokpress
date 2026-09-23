@@ -1,4 +1,4 @@
-.PHONY: help install dev test test-quick lint lint-fix format format-check pre-commit clean check paper paper-clean bench bench-encodings regression
+.PHONY: help install rust rust-check dev test test-quick lint lint-fix format format-check pre-commit clean check paper paper-clean bench bench-encodings regression
 
 VENV ?= .venv
 BIN := $(shell [ -d $(VENV)/bin ] && echo $(VENV)/bin/ || echo "")
@@ -6,6 +6,8 @@ BIN := $(shell [ -d $(VENV)/bin ] && echo $(VENV)/bin/ || echo "")
 help:
 	@echo "TokPress development commands:"
 	@echo "  make install       Install package in editable mode"
+	@echo "  make rust          Build the Rust extension into the venv (maturin develop --release)"
+	@echo "  make rust-check    cargo fmt --check + clippy"
 	@echo "  make dev           Install dev dependencies and pre-commit hooks"
 	@echo "  make test          Run the full pytest suite"
 	@echo "  make test-quick    Run the fast pytest subset (excludes @slow tests)"
@@ -24,6 +26,13 @@ help:
 
 install:
 	$(BIN)pip install -e .
+
+rust:
+	$(BIN)maturin develop --release
+
+rust-check:
+	cargo fmt --check
+	cargo clippy --release -- -D warnings
 
 dev:
 	$(BIN)pip install -e ".[dev]"
